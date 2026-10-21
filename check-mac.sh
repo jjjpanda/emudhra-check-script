@@ -420,6 +420,8 @@ elif ! sv=$(to 15 docker version --format '{{.Server.Version}}' 2>/dev/null </de
   warn "docker daemon not reachable; images/containers not checked (start Docker Desktop, re-run)"
 else
   info "docker client $(docker version --format '{{.Client.Version}}' 2>/dev/null), server $sv"
+  [ -z "$(docker images -q 2>/dev/null | head -1)" ] && info "no local images"
+  [ -z "$(docker ps -q 2>/dev/null | head -1)" ] && info "no running containers"
   while IFS= read -r img <&3; do
     probe "image $img" "$(to 300 docker run --rm --pull=never --entrypoint sh "$img" -c "$IMG_SH" sh $URLS 2>/dev/null </dev/null)" \
       "rebuild/pull $img with updated ca-certificates"

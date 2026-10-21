@@ -167,17 +167,28 @@ function OpensslCodes($exe) {
   })
 }
 
-# Windows trust (CryptoAPI chain engine + Disallowed store), as used by .NET / PowerShell / Schannel apps
+# Windows trust (CryptoAPI chain engine + Disallowed store), as used by .NET / PowerShell / Schannel apps.
+# The TLS callback records the policy errors and chain status Windows computed, then lets the handshake finish.
 function NetCodes {
   -join ($Urls | ForEach-Object {
+    $h = ([uri]$_).Host; $script:chainResult = ''
     try {
-      $r = [Net.WebRequest]::Create($_); $r.Timeout = 15000
-      $r.GetResponse().Close(); 'S'
-    } catch {
-      $w = $_.Exception; $msg = ''
-      for ($x = $w; $x; $x = $x.InnerException) { $msg += " $($x.Message)"; if ($x -is [Net.WebException]) { $w = $x } }
-      if ($w.Response) { 'S' } elseif ($w.Status -eq 'TrustFailure' -or (Rejected $msg)) { 'C' } else { 'N' }
-    }
+      $tcp = New-Object Net.Sockets.TcpClient
+      if ($tcp.ConnectAsync($h, 443).Wait(15000)) {
+        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [Net.Security.RemoteCertificateValidationCallback] {
+          param($sender, $cert, $chain, $errors)
+          $script:chainResult = "$errors " + (@($chain.ChainStatus | ForEach-Object Status) -join ' ')
+          $true
+        })
+        $ssl.ReadTimeout = 15000
+        $ssl.AuthenticateAsClient($h)
+        $ssl.Dispose()
+      }
+      $tcp.Dispose()
+    } catch {}
+    if ($script:chainResult -match '^None\s*$') { 'S' }
+    elseif ($script:chainResult -match 'UntrustedRoot|Revoked|PartialChain|NotTrusted|ExplicitDistrust') { 'C' }
+    else { 'N' }
   })
 }
 
@@ -299,10 +310,10 @@ $rootHashes = StoreHashes 'Root'
 foreach ($h in $Roots.Keys) { if ($rootHashes -contains $h) { Info "root present in Root store: $($Roots[$h])" } }
 Res '.NET/Schannel (Windows trust)' (NetCodes) $WinFix
 
-$GitCurl = Cands @() @("$env:ProgramFiles\Git\mingw64\bin\curl.exe") | Select-Object -First 1
+$GitCurl = Cands @() @("$env:ProgramFiles\Git\ucrt64\bin\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe") | Select-Object -First 1
 
 Hdr 'curl'
-foreach ($c in (Cands @('curl.exe') @("$env:SystemRoot\System32\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe"))) {
+foreach ($c in (Cands @('curl.exe') @("$env:SystemRoot\System32\curl.exe", "$env:ProgramFiles\Git\ucrt64\bin\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe"))) {
   Info "$((Lines (Run $c @('--version') 15))[0]) ($c)"
   $fix = if ($c -like "$env:SystemRoot\*") { $WinFix } else { 'update this curl / its CA bundle (Git for Windows: update Git)' }
   Res "curl ($c)" (CurlCodes $c @()) $fix
@@ -317,7 +328,7 @@ foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
 }
 
 Hdr 'openssl'
-foreach ($o in (Cands @('openssl.exe') @("$env:ProgramFiles\Git\usr\bin\openssl.exe", "$env:ProgramFiles\OpenSSL-Win64\bin\openssl.exe"))) {
+foreach ($o in (Cands @('openssl.exe') @("$env:ProgramFiles\Git\ucrt64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe", "$env:ProgramFiles\OpenSSL-Win64\bin\openssl.exe"))) {
   Info "$((Run $o @('version') 15).Out.Trim()) ($o)"
   $fix = if ($o -like '*\Git\*') { 'update Git for Windows (bundled ca-bundle.crt)' } else { 'update the CA bundle this openssl uses' }
   Res "openssl s_client ($o)" (OpensslCodes $o) $fix
@@ -358,7 +369,7 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
 }
 
 Hdr 'Bundles shipped with Git for Windows'
-foreach ($f in "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\usr\ssl\certs\ca-bundle.crt") {
+foreach ($f in "$env:ProgramFiles\Git\ucrt64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\usr\ssl\certs\ca-bundle.crt") {
   Bundle 'Git bundle (used when sslBackend=openssl)' $f 'update Git for Windows; or: git config --global http.sslBackend schannel'
 }
 
@@ -463,10 +474,13 @@ else {
     $dockerOk = $true
     Info "docker client $((Run $docker @('version', '--format', '{{.Client.Version}}') 20).Out.Trim()), server $sv"
     $images = Lines (Run $docker @('images', '--format', '{{.Repository}}:{{.Tag}}') 30) | Where-Object { $_ -and $_ -notmatch '<none>' } | Sort-Object -Unique
+    if (-not $images) { Info 'no local images' }
     foreach ($img in $images) {
       Probe "image $img" (Lines (Run $docker (@('run', '--rm', '--pull=never', '--entrypoint', 'sh', $img, '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild/pull $img with updated ca-certificates"
     }
-    foreach ($row in (Lines (Run $docker @('ps', '--format', '{{.Names}}|{{.Image}}') 30) | Where-Object { $_ })) {
+    $running = @(Lines (Run $docker @('ps', '--format', '{{.Names}}|{{.Image}}') 30) | Where-Object { $_ })
+    if (-not $running) { Info 'no running containers' }
+    foreach ($row in $running) {
       $name, $img = $row -split '\|', 2
       Probe "running container $name ($img)" (Lines (Run $docker (@('exec', $name, 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild $img with updated ca-certificates, then redeploy $name"
     }
