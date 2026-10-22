@@ -639,7 +639,7 @@ else {
       switch ($r.Code) {
         0 { Ok "WSL $($d.Name): no issues" }
         1 {
-          $fixCmd = if ($r.Out -match 'Fix commands') { "wsl -d $(Q $d.Name) -e bash $(Q $p) --fix$(if ($dockerOk) { ' --no-docker' }); if (`$LASTEXITCODE -eq 3) { throw 'a fix command failed inside WSL' }; `$global:LASTEXITCODE = 0" }
+          $fixCmd = if ($r.Out -match 'Fix commands') { "wsl -d $(Q $d.Name) -e bash $(Q $p) --fix$(if ($dockerOk) { ' --no-docker' }); if (`$LASTEXITCODE -notin 0, 1, 2) { throw ""WSL fix run failed (exit `$LASTEXITCODE)"" }; `$global:LASTEXITCODE = 0" }
           Fail "WSL $($d.Name): issues found (see its SUMMARY above)" "apply the manual steps listed for WSL $($d.Name) above" $fixCmd
         }
         2 { Warn "WSL $($d.Name): some checks not verified (see its SUMMARY above)" }

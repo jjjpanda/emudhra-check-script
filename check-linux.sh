@@ -224,8 +224,8 @@ bfix() {
 by() {
   local r b; r=$(rp "$1"); b=$(brewof "$r")
   case $r in
-    /usr/*|/bin/*|/etc/*)    FS=$CAFIX; FC=$CACMD ;;
     */Cellar/*|*/.linuxbrew/*) FS=; FC="$b update && $b upgrade ca-certificates" ;;
+    /usr/*|/bin/*|/etc/*)    FS=$CAFIX; FC=$CACMD ;;
     *)                       FS="update $1 or point it to a patched CA bundle"; FC= ;;
   esac
 }
