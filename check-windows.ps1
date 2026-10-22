@@ -4,20 +4,27 @@
   Ref: https://emudhra.we-have-a-problem.com/
 
 .DESCRIPTION
-  Usage:   powershell -ExecutionPolicy Bypass -File .\check-windows.ps1
-  Method:  1) compare installed versions against the patched-version table
-           2) live TLS test: each client connects to the 12 advisory test hosts
+  Usage:   powershell -ExecutionPolicy Bypass -File .\check-windows.ps1 [-Fix]
+  Method:  1) live TLS test: each client connects to the 12 advisory test hosts
               (6 compromised TLS intermediates x 2 roots: emSign Root TLS G3 and the
               Sectigo "AAA Certificate Services" cross-sign) plus a control host.
               A patched client must REJECT all 12.
+           2) compare versions against the patched-version table: always for Java, Go, Electron
+              and tools; for certifi, pip and node only if the live test is not verified
+           Browsers are not driven; the SUMMARY gives a manual test.
   Codes:   13 letters per client = 12 test hosts (order of $TestHosts), then control (example.com)
            S = TLS accepted   C = rejected as untrusted/revoked   N = network/other error
            any S in the first 12 = FAIL;  CCCCCCCCCCCC + S = OK;  anything else = NOT VERIFIED
-  WSL:     each distro is scanned with check-linux.sh if it sits next to this script,
+  WSL:     each distro is scanned with check-unix.sh if it sits next to this script,
            else with a short built-in probe (curl/wget/python3 + ca-certificates version).
-  Output:  [OK] / [INFO] / [WARN] / [FAIL] lines, then a SUMMARY with remediation steps.
-  Exit:    0 = no issues, 1 = issues found, 2 = no issues but some checks not verified
+  Output:  [OK] / [INFO] / [WARN] / [FAIL] lines, then a SUMMARY: issues, fix commands, manual steps.
+  -Fix:    after the checks, run the fix commands (only package-manager / self-update
+           commands that are known to be correct for how each item was installed).
+           conda: 'conda update' can re-solve the env and change other packages in it.
+  Exit:    0 = no issues, 1 = issues found, 2 = no issues but some checks not verified;
+           with -Fix: 3 = a fix command failed; else the codes above, from the scan before the fixes (re-run to verify)
 #>
+param([switch]$Fix)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $Ref = 'https://emudhra.we-have-a-problem.com/'
@@ -26,8 +33,12 @@ $Urls = @($TestHosts | ForEach-Object { "https://$_-emudhra.we-have-a-problem.co
 $NT = $TestHosts.Count
 $Issues = New-Object System.Collections.Generic.List[string]
 $Untested = New-Object System.Collections.Generic.List[string]
+$Cmds = New-Object System.Collections.Generic.List[string]
+$Steps = New-Object System.Collections.Generic.List[string]
+$ToolFix = @{}
 $SeenBundles = @{}
 $WinFix = "install Windows updates; else run Block-EmudhraCompromisedCA.ps1 elevated (see $Ref)"
+$GitFix = "update Git for Windows (git update-git-for-windows); if its bundles still trust the test hosts, from an elevated prompt: copy the emSign and AAA root PEMs (see $Ref) to <Git>\etc\pki\ca-trust\source\blocklist\, run '<Git>\usr\bin\sh.exe -c /usr/bin/update-ca-trust', then copy <Git>\etc\pki\ca-trust\extracted\pem\tls-ca-bundle.pem over <Git>\mingw64\etc\ssl\certs\ca-bundle.crt and <Git>\ucrt64\etc\ssl\certs\ca-bundle.crt"
 
 # SHA-256 of the 16 compromised intermediates + Sectigo cross-signs (impacted-intermediates.json)
 $Intermediates = @(
@@ -50,16 +61,27 @@ $Roots = @{
 
 function Ok($m) { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Info($m) { Write-Host "[INFO] $m" }
-function Fail($m, $fix) { Write-Host "[FAIL] $m" -ForegroundColor Red; $Issues.Add("$m -> $fix") }
-function Warn($m, $fix) { Write-Host "[WARN] $m" -ForegroundColor Yellow; if ($fix) { $Issues.Add("$m -> $fix") } else { $Untested.Add($m) } }
+function Fail($m, $step, $cmd) { Write-Host "[FAIL] $m" -ForegroundColor Red; Note $m $step $cmd }
+function Warn($m, $step, $cmd) { Write-Host "[WARN] $m" -ForegroundColor Yellow; if ($step -or $cmd) { Note $m $step $cmd } else { $Untested.Add($m) } }
+function Q($p) { "'" + ("$p" -replace "'", "''") + "'" }
+
+# Note: record an issue; $cmd = command safe to run with -Fix, else $step is a manual step
+function Note($m, $step, $cmd) {
+  if ($cmd) {
+    if (-not $Cmds.Contains($cmd)) { $Cmds.Add($cmd) }
+    $Issues.Add("$m  -> cmd $($Cmds.IndexOf($cmd) + 1)")
+  } else {
+    if (-not $Steps.Contains("$step")) { $Steps.Add("$step") }
+    $Issues.Add("$m  -> step $($Steps.IndexOf("$step") + 1)")
+  }
+}
 function Hdr($m) { Write-Host "`n== $m ==" -ForegroundColor Cyan }
 function Ver($text) { [regex]::Match("$text", '\d+(\.\d+)+').Value }
 function Kv($lines, $key) { (@($lines) | Where-Object { "$_" -like "$key=*" } | Select-Object -First 1) -replace "^$key=", '' }
 function Lines($result) { @("$($result.Out)" -split "`r?`n") }
 function Redact($s) { "$s" -replace '//[^/@]*@', '//***@' }
 
-# Rejected: true only for untrusted-issuer / revoked errors (not generic TLS or network errors).
-# GnuTLS clients only say "server certificate verification failed"; the test hosts are otherwise valid.
+# Rejected: true only for untrusted-issuer / revoked errors (not generic TLS or network errors)
 function Rejected($msg) { "$msg" -match 'local issuer|issuer certificate|self.signed certificate in|locally verify|unable to verify the first|revoked|untrusted|not trusted|server certificate verification failed' }
 
 # Run: start a native exe with a hard deadline; returns .Out, .Err, .Code (-1 = timed out, -2 = could not start)
@@ -74,7 +96,10 @@ function Run($exe, [string[]]$arguments, [int]$sec = 60) {
   try { $p = [Diagnostics.Process]::Start($psi) } catch { return [pscustomobject]@{ Out = ''; Err = "$_"; Code = -2 } }
   $p.StandardInput.Close()
   $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit($sec * 1000)) { $p.Kill(); return [pscustomobject]@{ Out = ''; Err = 'timeout'; Code = -1 } }
+  if (-not $p.WaitForExit($sec * 1000)) {
+    try { $p.Kill($true) } catch { & taskkill.exe /T /F /PID $p.Id 2>&1 | Out-Null }
+    return [pscustomobject]@{ Out = ''; Err = 'timeout'; Code = -1 }
+  }
   [pscustomobject]@{ Out = $out.Result; Err = $err.Result; Code = $p.ExitCode }
 }
 
@@ -95,35 +120,142 @@ function VGe($a, $b) {
 function Branch($v, $n) { (@([regex]::Matches("$v", '\d+') | ForEach-Object Value) | Select-Object -First $n) -join '.' }
 
 # Need: OK if version >= patch of its branch, or >= all patches; pre-release builds fail
-function Need($label, $v, $depth, $fix, [string[]]$patched) {
+function Need($label, $v, $depth, $fx, [string[]]$patched) {
+  if (-not $v) { Warn "${label}: version unknown"; return }
   $want = $patched -join ' | '
-  if ("$v" -match '-(rc|beta|alpha|pre|ea|nightly|canary)') { Fail "$label $v (pre-release)" "$fix to a stable release (>= $want)"; return }
+  if ("$v" -match '-(rc|beta|alpha|pre|ea|nightly|canary)') { Fail "$label $v (pre-release)" "$fx to a stable release (>= $want)"; return }
   $all = $true
   foreach ($p in $patched) {
     if (-not (VGe $v $p)) { $all = $false; continue }
     if ((Branch $v $depth) -eq (Branch $p $depth)) { Ok "$label $v"; return }
   }
-  if ($all) { Ok "$label $v" } else { Fail "$label $v" "$fix (>= $want)" }
+  if ($all) { Ok "$label $v" } else { Fail "$label $v" "$fx (>= $want)" }
 }
 
-# One: single minimum version check for a tool on PATH
-function One($name, $min, $fix, $exe, [string[]]$arguments) {
-  $cmd = Get-Command $exe | Select-Object -First 1
-  if (-not $cmd) { return }
-  $ErrorActionPreference = 'Continue'
-  $v = Ver ((& $cmd @arguments 2>&1 | ForEach-Object { "$_" }) -join "`n")
-  if (-not $v) { Warn "${name}: version unknown"; return }
-  if (VGe $v $min) { Ok "$name $v" } else { Fail "$name $v" "$fix (>= $min)" }
+# VChk: fallback version check when a live test is not verified
+function VChk($label, $v, $min, $step, $cmd) {
+  if (-not $v) { return }
+  if (VGe $v $min) { Ok "$label $v" } else { Fail "$label $v (need >= $min)" $step $cmd }
+}
+
+# Writable: true if the current user can create files in $dir
+function Writable($dir) {
+  try { $f = Join-Path $dir ".w$([guid]::NewGuid())"; [IO.File]::Create($f).Dispose(); Remove-Item -LiteralPath $f; $true } catch { $false }
+}
+
+# ScoopCmd: preserve install scope; environment overrides config, then the active Scoop root.
+function ScoopCmd($path) {
+  $target = $path
+  $shim = [IO.Path]::ChangeExtension($path, 'shim')
+  if (Test-Path -LiteralPath $shim -PathType Leaf) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $shim), '(?m)^\s*path\s*=\s*"([^"\r\n]+)"')
+    if (-not $m.Success) { return '' }
+    $target = $m.Groups[1].Value
+  }
+  $activeRoot = "$env:USERPROFILE\scoop"
+  $scoop = Get-Command scoop -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($scoop.Source -match '^(.*)\\(?:shims\\scoop\.(?:ps1|cmd|exe)|apps\\scoop\\[^\\]+\\bin\\scoop\.ps1)$') { $activeRoot = $Matches[1] }
+  $configHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { "$env:USERPROFILE\.config" }
+  $configFile = "$configHome\scoop\config.json"
+  if (Test-Path -LiteralPath "$activeRoot\config.json" -PathType Leaf) { $configFile = "$activeRoot\config.json" }
+  $config = $null
+  if (Test-Path -LiteralPath $configFile -PathType Leaf) {
+    try { $config = Get-Content -Raw -LiteralPath $configFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { return '' }
+  }
+  $roots = @(
+    @{ Root = (@($env:SCOOP, $config.root_path, $activeRoot) | Where-Object { $_ } | Select-Object -First 1); Global = $false },
+    @{ Root = (@($env:SCOOP_GLOBAL, $config.global_path, "$env:ProgramData\scoop") | Where-Object { $_ } | Select-Object -First 1); Global = $true }
+  )
+  foreach ($install in $roots) {
+    $root = [IO.Path]::GetFullPath($install.Root).TrimEnd('\')
+    $m = [regex]::Match($target, ('(?i)^' + [regex]::Escape($root) + '\\apps\\([^\\]+)\\'))
+    if ($m.Success) { return "scoop update$(if ($install.Global) { ' --global' }) $(Q $m.Groups[1].Value)" }
+  }
+  ''
+}
+
+# UpCmd: upgrade command for the copy of a tool at $path, by how it was installed (empty = unsure)
+function UpCmd($path, $self) {
+  $name = [IO.Path]::GetFileNameWithoutExtension($path)
+  $key = (Get-Item -LiteralPath $path).FullName.ToLower()
+  if ($ToolFix.ContainsKey($key)) { return $ToolFix[$key] }
+  $scoop = ScoopCmd $path
+  if ($scoop) { return $scoop }
+  switch -Regex ($path) {
+    '\\scoop\\' { return '' }
+    '\\chocolatey\\' { return '' }
+    '\\WinGet\\|\\WindowsApps\\' { return '' }
+    '\\mise\\installs\\([^\\]+)\\' { return "mise upgrade $(Q $Matches[1])" }
+    '\\\.pixi\\bin\\' { if ($name -ne 'pixi') { return "pixi global update $(Q $name)" } }
+    '\\\.cargo\\bin\\' { if ($name -ne 'rustup') { return '' } }
+  }
+  if ($path -match '\.(cmd|ps1)$') {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $path), 'node_modules\\((@[^\\]+\\)?[^\\"]+)')
+    if (-not $m.Success) { return '' }
+    $pkg = Q ($m.Groups[1].Value -replace '\\', '/')
+    $dir = Split-Path $path
+    if ($path -match '\\pnpm\\') { return "pnpm add -g $pkg" }
+    if ($path -match '\\\.bun\\') { return "bun add -g $pkg" }
+    if ($path -match '\\Yarn\\') { return "yarn global add $pkg" }
+    if ((Test-Path "$dir\node.exe") -and (Test-Path "$dir\node_modules\npm\bin\npm-cli.js")) { return "& $(Q "$dir\node.exe") $(Q "$dir\node_modules\npm\bin\npm-cli.js") install -g --prefix $(Q $dir) $pkg" }
+    return "npm install -g --prefix $(Q $dir) $pkg"
+  }
+  # uv tool exports share .local\bin with standalone installs; unknown ownership stays manual.
+  if ($name -eq 'uv') { return '' }
+  if ($path -like "$env:USERPROFILE\*" -and $path -match '\\\.(local|deno|pixi|cargo)\\bin\\[^\\]+$') { "& $(Q $path) $self" } else { '' }
+}
+
+# Tool: version-check every copy of a tool (PATH and python envs); fix by install method
+function Tool($name, $min, $self) {
+  $extra = @($ToolFix.Keys | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -eq $name })
+  foreach ($p in (Cands @("$name.exe", "$name.cmd") $extra)) {
+    $v = Ver (Run $p @('--version') 30).Out
+    if (-not $v -and $p -match '\.cmd$') { $v = Ver (& $p --version 2>$null) }
+    if (-not $v) { Warn "$name ($p): version unknown"; continue }
+    if (VGe $v $min) { Ok "$name $v ($p)" } else { Fail "$name $v ($p) (need >= $min)" "upgrade $p with the tool that installed it" (UpCmd $p $self) }
+  }
+}
+
+function PipxCmd($prefix, $cmd) { "`$previousPipxHome = `$env:PIPX_HOME; try { `$env:PIPX_HOME = $(Q (Split-Path (Split-Path $prefix))); pipx $cmd } finally { `$env:PIPX_HOME = `$previousPipxHome }" }
+
+# InvokeFix: catch PowerShell errors and native nonzero exits; printed errors alone need a re-scan.
+function InvokeFix($command) {
+  $ErrorActionPreference = 'Stop'
+  $global:LASTEXITCODE = 0
+  try {
+    Invoke-Expression $command | Out-Host
+    [pscustomobject]@{ Ok = ($? -and $LASTEXITCODE -eq 0); Code = $LASTEXITCODE; Error = '' }
+  } catch {
+    [pscustomobject]@{ Ok = $false; Code = $LASTEXITCODE; Error = $_.Exception.Message }
+  }
+}
+
+# PyFix: command that upgrades $pkgs in the env of $py (pipx / uv tool / conda / uv / pip, user or env install)
+function PyFix($py, $prefix, $em, $inst, $user, [string[]]$pkgs) {
+  $p = $pkgs -join ' '
+  if (Test-Path "$prefix\pipx_metadata.json") { return PipxCmd $prefix "runpip $(Q (Split-Path $prefix -Leaf)) install -U $p" }
+  if ($prefix -match '\\uv\\tools\\([^\\]+)') { return "uv tool upgrade $(Q $Matches[1])" }
+  if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { return "pixi global update $(Q (Split-Path $prefix -Leaf))" }
+  if ($em -eq '1' -or (Test-Path "$prefix\pyvenv.cfg")) { return '' }
+  if ($user -eq '1') { return "& $(Q $py) -m pip install --user -U $p" }
+  if (-not (Writable "$prefix\Lib\site-packages")) { return '' }
+  switch ($inst) {
+    'conda' { if ($Conda) { "$Conda update -y -p $(Q $prefix) $p" } }
+    'uv' { "uv pip install -p $(Q $py) -U $p" }
+    default { "& $(Q $py) -m pip install -U $p" }
+  }
 }
 
 # Res: CODES = one letter per test host, then the control host
-function Res($label, $codes, $fix) {
+function Res($label, $codes, $step, $cmd) {
   $c = "$codes".Trim()
   $tests = if ($c.Length -gt 1) { $c.Substring(0, $c.Length - 1) } else { '' }
   $n = @($tests.ToCharArray() | Where-Object { $_ -eq 'S' }).Count
-  if ($n -gt 0) { Fail "${label}: TRUSTS $n/$NT compromised chains [$c]" $fix }
+  $script:NV = $false
+  if ($n -gt 0) { Fail "${label}: TRUSTS $n/$NT compromised chains [$c]" $step $cmd }
   elseif ($c -ceq ('C' * $NT + 'S')) { Ok "${label}: rejects all $NT compromised chains" }
-  else { Warn "${label}: not verified [$(if ($c) { $c } else { 'no output' })]" }
+  else { Warn "${label}: not verified [$(if ($c) { $c } else { 'no output' })]"; $script:NV = $true }
 }
 
 # Cands: unique executables from PATH names and explicit paths/globs
@@ -172,43 +304,47 @@ function OpensslCodes($exe) {
 # The TLS callback records the policy errors and chain status Windows computed, then lets the handshake finish.
 function NetCodes {
   -join ($Urls | ForEach-Object {
-    $h = ([uri]$_).Host; $script:chainResult = ''
-    try {
-      $tcp = New-Object Net.Sockets.TcpClient
-      if ($tcp.ConnectAsync($h, 443).Wait(15000)) {
-        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [Net.Security.RemoteCertificateValidationCallback] {
-          param($sender, $cert, $chain, $errors)
-          $script:chainResult = "$errors " + (@($chain.ChainStatus | ForEach-Object Status) -join ' ')
-          $true
-        })
-        $ssl.ReadTimeout = 15000
-        $ssl.AuthenticateAsClient($h)
-        $ssl.Dispose()
-      }
-      $tcp.Dispose()
-    } catch {}
-    if ($script:chainResult -match '^None\s*$') { 'S' }
-    elseif ($script:chainResult -match 'UntrustedRoot|Revoked|PartialChain|NotTrusted|ExplicitDistrust') { 'C' }
-    else { 'N' }
+    $h = ([uri]$_).Host
+    foreach ($try in 1, 2) {
+      $script:chainResult = ''; $tcp = $null
+      try {
+        $tcp = New-Object Net.Sockets.TcpClient
+        if ($tcp.ConnectAsync($h, 443).Wait(15000)) {
+          $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [Net.Security.RemoteCertificateValidationCallback] {
+            param($sender, $cert, $chain, $errors)
+            $script:chainResult = "$errors " + (@($chain.ChainStatus | ForEach-Object Status) -join ' ')
+            $true
+          })
+          $ssl.ReadTimeout = 15000
+          $ssl.AuthenticateAsClient($h)
+          $ssl.Dispose()
+        }
+      } catch {} finally { if ($tcp) { $tcp.Dispose() } }
+      $r = if ($script:chainResult -match '^None\s*$') { 'S' }
+           elseif ($script:chainResult -match 'UntrustedRoot|Revoked|PartialChain|NotTrusted|ExplicitDistrust') { 'C' }
+           else { 'N' }
+      if ($r -ne 'N') { break }
+    }
+    $r
   })
 }
 
 # Probe: report an in-container test (lines: codes, ca-certificates version, client used)
-function Probe($label, $lines, $fix) {
+function Probe($label, $lines, $fx) {
   $codes = "$(@($lines)[0])".Trim(); $pkg = "$(@($lines)[1])".Trim(); $via = "$(@($lines)[2])".Trim()
   if (-not $codes) { Warn "${label}: cannot run sh (distroless/other arch/timeout)" }
   elseif ($codes -match 'X') { Warn "${label}: no curl/wget/python3 inside; ca-certificates $pkg" }
-  else { Res "$label via $via [ca-certificates $pkg]" $codes $fix }
+  else { Res "$label via $via [ca-certificates $pkg]" $codes $fx }
 }
 
 # Bundle: live-test one PEM CA bundle file (once per path)
-function Bundle($label, $file, $fix) {
+function Bundle($label, $file, $step, $cmd) {
   if (-not $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { return }
   $key = (Get-Item -LiteralPath $file).FullName.ToLower()
   if ($SeenBundles[$key]) { return }
   $SeenBundles[$key] = 1
-  if ($script:PyB) { Res "$label ($file)" (Run $script:PyB (@("$T\probe.py", '--cafile', $file) + $Urls) 300).Out $fix }
-  elseif ($script:GitCurl) { Res "$label ($file)" (CurlCodes $script:GitCurl @('--cacert', $file)) $fix }
+  if ($script:PyB) { Res "$label ($file)" (Run $script:PyB (@("$T\probe.py", '--cafile', $file) + $Urls) 300).Out $step $cmd }
+  elseif ($script:GitCurl) { Res "$label ($file)" (CurlCodes $script:GitCurl @('--cacert', $file)) $step $cmd }
   else { Warn "$label ($file): no python/OpenSSL curl to test bundle" }
 }
 
@@ -223,20 +359,12 @@ try:
 except ImportError:
     print("ver=" + sys.version.split()[0]); sys.exit()
 VerifyError = getattr(ssl, "SSLCertVerificationError", None)
-REJECT = (2, 19, 20, 21, 23, 28)  # issuer unknown/untrusted, self-signed in chain, revoked, rejected
-# truststore (e.g. injected from sitecustomize) verifies with the OS and reports its codes instead: Windows
-# CRYPT_E_REVOKED, CERT_E_UNTRUSTEDROOT, CERT_E_CHAINING, CERT_E_REVOKED, TRUST_E_EXPLICIT_DISTRUST
-OS_REJECT = (0x80092010, 0x800B0109, 0x800B010A, 0x800B010C, 0x800B0111)
-OS_REJECT_MSG = ("revoked", "not trusted", "untrusted", "distrust")
+REJECT = (2, 19, 20, 21, 23, 28, 0x80092010, 0x800B0109, 0x800B010A, 0x800B010C, 0x800B0111)  # OpenSSL: issuer unknown/untrusted, self-signed in chain, revoked, rejected; Windows (truststore): revoked, untrusted root, chaining, revoked, explicit distrust
 TRUSTSTORE = ssl.SSLContext.__module__.startswith("truststore")
 def rejected(r):
-    if r.verify_code in REJECT:
-        return True
-    if not TRUSTSTORE:
-        return False
-    return r.verify_code in OS_REJECT or any(s in str(r.verify_message or r).lower() for s in OS_REJECT_MSG)
+    return r.verify_code in REJECT or TRUSTSTORE and any(s in str(r.verify_message or r).lower() for s in ("revoked", "not trusted", "untrusted", "distrust"))
+# CA file tests must use OpenSSL with only that file, not the OS verifier truststore injects
 def plain():
-    # CA file tests must use OpenSSL with only that file, not the OS verifier truststore injects
     global TRUSTSTORE
     if TRUSTSTORE:
         import truststore; truststore.extract_from_ssl(); TRUSTSTORE = False
@@ -257,6 +385,8 @@ def codes(urls, cafile=None):
 args = sys.argv[1:]
 if args[:1] == ["--cafile"]:
     plain(); print(codes(args[2:], args[1])); sys.exit()
+import os, site, sysconfig
+venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 print("ver=" + sys.version.split()[0])
 if TRUSTSTORE:
     print("ts=1")
@@ -272,6 +402,26 @@ try:
     import pip; print("pip=" + pip.__version__)
 except Exception:
     pass
+print("em=%d" % (not venv and os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))))
+try:
+    from importlib.metadata import distribution
+except ImportError:
+    sys.exit()
+user = getattr(site, "getusersitepackages", lambda: "?")()
+for n in ("certifi", "uv", "deno"):
+    try:
+        d = distribution(n)
+        inst = (d.read_text("INSTALLER") or "pip").strip()
+        print("inst_%s=%s" % (n, inst))
+        loc = os.path.realpath(str(d.locate_file("")))
+        usr = loc == os.path.realpath(user)
+        if not (usr or loc.startswith(os.path.realpath(sys.prefix) + os.sep)):
+            continue
+        for f in d.files or []:
+            if f.name in (n, n + ".exe"):
+                print("tool=%s|%s|%d" % (os.path.realpath(str(d.locate_file(f))), inst, usr))
+    except Exception:
+        pass
 '@
 
 Set-Content -Encoding ASCII "$T\probe.js" @'
@@ -330,13 +480,15 @@ $rootHashes = StoreHashes 'Root'
 foreach ($h in $Roots.Keys) { if ($rootHashes -contains $h) { Info "root present in Root store: $($Roots[$h])" } }
 Res '.NET/Schannel (Windows trust)' (NetCodes) $WinFix
 
+$GitBundles = 'ucrt64\etc\ssl\certs\ca-bundle.crt', 'mingw64\etc\ssl\certs\ca-bundle.crt', 'mingw64\ssl\certs\ca-bundle.crt', 'usr\ssl\certs\ca-bundle.crt'
 $GitCurl = Cands @() @("$env:ProgramFiles\Git\ucrt64\bin\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe") | Select-Object -First 1
+$PyB = Cands @('python.exe', 'python3.exe') @() | Where-Object { (Run $_ @('-c', 'import ssl; ssl.create_default_context') 30).Code -eq 0 } | Select-Object -First 1
 
 Hdr 'curl'
 foreach ($c in (Cands @('curl.exe') @("$env:SystemRoot\System32\curl.exe", "$env:ProgramFiles\Git\ucrt64\bin\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe"))) {
   Info "$((Lines (Run $c @('--version') 15))[0]) ($c)"
-  $fix = if ($c -like "$env:SystemRoot\*") { $WinFix } else { 'update this curl / its CA bundle (Git for Windows: update Git)' }
-  Res "curl ($c)" (CurlCodes $c @()) $fix
+  $fx = if ($c -like "$env:SystemRoot\*") { $WinFix } elseif ($c -like '*\Git\*') { $GitFix } else { "update $c or its CA bundle" }
+  Res "curl ($c)" (CurlCodes $c @()) $fx
   Bundle 'curl bundle' (Join-Path (Split-Path $c) 'curl-ca-bundle.crt') 'replace curl-ca-bundle.crt with a patched bundle'
 }
 
@@ -344,54 +496,84 @@ Hdr 'git'
 foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
   $backend = (Run $g @('config', '--get', 'http.sslBackend') 15).Out.Trim()
   Info "$((Run $g @('--version') 15).Out.Trim()) ($g) sslBackend=$(if ($backend) { $backend } else { 'default' })"
-  Res "git ls-remote ($g)" (GitCodes $g) 'update Git for Windows; or: git config --global http.sslBackend schannel'
+  $scope = (Run $g @('config', '--show-scope', '--get', 'http.sslBackend') 15).Out
+  $fx = if ($backend -eq 'schannel') { $WinFix } elseif ($scope -match '^(local|worktree|command)') { "$GitFix; or set http.sslBackend=schannel where 'git config --show-origin --get http.sslBackend' points" } else { $GitFix }
+  $ca = (Run $g @('config', '--path', '--get', 'http.sslCAInfo') 15).Out.Trim()
+  $root = $g -replace '\\(cmd|bin|(mingw64|ucrt64)\\bin)\\git\.exe$'
+  $own = $ca -and ($GitBundles | ForEach-Object { "$root\$_" }) -contains [IO.Path]::GetFullPath($ca)
+  $custom = $env:GIT_SSL_CAINFO -or $env:GIT_SSL_CAPATH -or $env:GIT_SSL_CERT -or $env:GIT_SSL_KEY -or (Run $g @('config', '--get-regexp', '^http\.(.+\.sslcainfo|(.+\.)?(sslcapath|sslcert|sslkey))$') 15).Out.Trim()
+  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and -not $custom -and (-not $ca -or $own)) { "& $(Q $g) config --global http.sslBackend schannel" }
+  Res "git ls-remote ($g)" (GitCodes $g) $fx $cmd
 }
 
 Hdr 'openssl'
 foreach ($o in (Cands @('openssl.exe') @("$env:ProgramFiles\Git\ucrt64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe", "$env:ProgramFiles\OpenSSL-Win64\bin\openssl.exe"))) {
   Info "$((Run $o @('version') 15).Out.Trim()) ($o)"
-  $fix = if ($o -like '*\Git\*') { 'update Git for Windows (bundled ca-bundle.crt)' } else { 'update the CA bundle this openssl uses' }
-  Res "openssl s_client ($o)" (OpensslCodes $o) $fix
+  $fx = if ($o -like '*\Git\*') { $GitFix } else { "update the CA bundle $o uses" }
+  Res "openssl s_client ($o)" (OpensslCodes $o) $fx
 }
 
 Hdr 'Python / pip / certifi'
+$Conda = @('conda', 'mamba', 'micromamba') | Where-Object { Get-Command $_ } | Select-Object -First 1
 $pyLauncher = @(& py -0p 2>$null | ForEach-Object { [regex]::Match("$_", '[A-Za-z]:\\.+?\.exe').Value } | Where-Object { $_ })
 $pyGlobs = @(
   "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe", "$env:ProgramFiles\Python*\python.exe", 'C:\Python*\python.exe',
   "$env:APPDATA\uv\python\*\python.exe", "$env:USERPROFILE\.pyenv\pyenv-win\versions\*\python.exe",
-  "$env:LOCALAPPDATA\mise\installs\python\*\python.exe"
-) + @(foreach ($base in "$env:USERPROFILE\miniconda3", "$env:USERPROFILE\anaconda3", "$env:USERPROFILE\miniforge3", "$env:ProgramData\miniconda3", "$env:ProgramData\anaconda3") {
+  "$env:LOCALAPPDATA\mise\installs\python\*\python.exe", "$env:USERPROFILE\scoop\apps\python*\current\python.exe",
+  "$env:PIPX_HOME\venvs\*\Scripts\python.exe", "$env:USERPROFILE\pipx\venvs\*\Scripts\python.exe", "$env:LOCALAPPDATA\pipx\pipx\venvs\*\Scripts\python.exe",
+  "$env:APPDATA\uv\tools\*\Scripts\python.exe", "$env:USERPROFILE\.virtualenvs\*\Scripts\python.exe",
+  "$env:LOCALAPPDATA\pypoetry\Cache\virtualenvs\*\Scripts\python.exe", "$env:USERPROFILE\.conda\envs\*\python.exe",
+  "$env:USERPROFILE\.pixi\envs\*\python.exe", "$env:USERPROFILE\.rye\py\*\python.exe"
+) + @(foreach ($base in "$env:USERPROFILE\miniconda3", "$env:USERPROFILE\anaconda3", "$env:USERPROFILE\miniforge3", "$env:USERPROFILE\mambaforge",
+    "$env:USERPROFILE\micromamba", "$env:ProgramData\miniconda3", "$env:ProgramData\anaconda3") {
   "$base\python.exe"; "$base\envs\*\python.exe"
 }) + $pyLauncher
 $pySeen = @{}
 foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
-  $prefix = (Run $py @('-c', 'import os,sys;print(os.path.realpath(sys.prefix))') 30).Out.Trim().ToLower()
+  $prefix = (Run $py @('-c', 'import os,sys;print(os.path.realpath(sys.prefix))') 30).Out.Trim()
   if (-not $prefix) { if ($py -notlike '*\WindowsApps\*') { Warn "python ($py): did not run" }; continue }
-  if ($pySeen[$prefix]) { continue }
-  $pySeen[$prefix] = 1
+  if ($pySeen[$prefix.ToLower()]) { continue }
+  $pySeen[$prefix.ToLower()] = 1
   $out = Lines (Run $py (@("$T\probe.py") + $Urls) 600)
   $v = Kv $out 'ver'
   if (-not (Kv $out 'sys')) { Warn "python $v ($py): too old to test or probe failed"; continue }
-  if (-not $script:PyB) { $script:PyB = $py }
-  $pipfix = "& '$py' -m pip install -U pip certifi"
-  $trust = if (Kv $out 'ts') { 'truststore: Windows trust incl. Disallowed' } else { 'Windows Root store, ignores Disallowed' }
-  Res "python $v ($py) default trust ($trust)" (Kv $out 'sys') 'pip install -U certifi truststore and use truststore (honors Disallowed); or set SSL_CERT_FILE to a patched certifi bundle'
+  if (-not $script:PyB -and $py -notlike '*\Scripts\*') { $script:PyB = $py }
+  $ps = if (Writable "$prefix\Lib\site-packages") { "upgrade pip and certifi in $prefix" } else { "from an elevated prompt: & $(Q $py) -m pip install -U pip certifi" }
+  $em = Kv $out 'em'
+  $pc = PyFix $py $prefix $em (Kv $out 'inst_certifi') 0 @('pip', 'certifi')
+  if (-not (Kv $out 'ts') -and (Test-Path "$prefix\conda-meta")) {
+    $ec = if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { "pixi global update $(Q (Split-Path $prefix -Leaf))" } else { if ($Conda) { "$Conda update -y -p $(Q $prefix) ca-certificates certifi openssl" } }
+    Res "python $v ($py) default trust" (Kv $out 'sys') "update ca-certificates, certifi and openssl in $prefix" $ec
+  } else {
+    if (Kv $out 'ts') { Res "python $v ($py) default trust (truststore: Windows trust)" (Kv $out 'sys') $WinFix }
+    else { Res "python $v ($py) default trust (Windows Root store, ignores Disallowed)" (Kv $out 'sys') 'pip install -U certifi truststore and use truststore (honors Disallowed); or set SSL_CERT_FILE to a patched certifi bundle' }
+  }
   $c = Kv $out 'certifi'
   if ($c) {
     $cv, $cp, $cc = $c -split '\|'
-    if (VGe $cv '2026.10.19') { Ok "certifi $cv ($cp)" } else { Fail "certifi $cv ($cp)" "$pipfix (certifi >= 2026.10.19)" }
-    Res "certifi bundle ($cp)" $cc $pipfix
+    $us, $uc = $ps, $pc
+    if ($cp -notlike "$prefix\*" -and $cp -like "$env:APPDATA\*") { $us = "upgrade the user-site certifi ($cp)"; $uc = $(if ($em -ne '1') { "& $(Q $py) -m pip install --user -U certifi" }) }
+    Res "certifi $cv bundle ($cp)" $cc $us $uc
+    if ($NV) { VChk "certifi ($cp)" $cv '2026.10.19' $us $uc }
     $SeenBundles[$cp.ToLower()] = 1
   }
-  $pv = Kv $out 'pip'
-  if ($pv) { if (VGe $pv '26.2.2') { Ok "pip $pv ($py)" } else { Fail "pip $pv ($py)" "$pipfix (pip >= 26.2.2)" } }
   $c = Kv $out 'pipcertifi'
-  if ($c) { $cv, $cp, $cc = $c -split '\|'; Res "pip vendored certifi $cv" $cc $pipfix }
+  if ($c) {
+    $cv, $cp, $cc = $c -split '\|'
+    $us, $uc = $ps, $pc
+    if ((Test-Path "$prefix\pipx_metadata.json") -and $cp -like "$(Split-Path (Split-Path $prefix))\shared\*") { $us = "upgrade pipx shared pip ($cp)"; $uc = PipxCmd $prefix 'upgrade-shared' }
+    Res "pip vendored certifi $cv ($py)" $cc $us $uc
+    if ($NV) { VChk "pip ($py)" (Kv $out 'pip') '26.2.2' $us $uc }
+  }
+  foreach ($tl in @($out | Where-Object { $_ -like 'tool=*' })) {
+    $tp, $ti, $tu = ($tl -replace '^tool=', '') -split '\|'
+    if (-not $ToolFix.ContainsKey($tp)) { $ToolFix[$tp] = PyFix $py $prefix $em $ti $tu @([IO.Path]::GetFileNameWithoutExtension($tp)) }
+  }
 }
 
 Hdr 'Bundles shipped with Git for Windows'
-foreach ($f in "$env:ProgramFiles\Git\ucrt64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\usr\ssl\certs\ca-bundle.crt") {
-  Bundle 'Git bundle (used when sslBackend=openssl)' $f 'update Git for Windows; or: git config --global http.sslBackend schannel'
+foreach ($f in ($GitBundles | ForEach-Object { "$env:ProgramFiles\Git\$_" })) {
+  Bundle 'Git bundle (used when sslBackend=openssl)' $f $GitFix
 }
 
 Hdr 'Node.js / npm'
@@ -401,8 +583,8 @@ $nodeGlobs = "$env:ProgramFiles\nodejs\node.exe", "$env:NVM_HOME\v*\node.exe", "
 foreach ($n in (Cands @('node.exe') $nodeGlobs)) {
   $v = (Run $n @('-v') 15).Out.Trim()
   if (-not $v) { continue }
-  Need "node ($n)" $v 1 'upgrade Node.js' @('22.23.4', '24.22.1', '26.12.1')
-  Res "node $v ($n)" (Run $n (@("$T\probe.js") + $Urls) 120).Out 'upgrade Node.js to a patched release'
+  Res "node $v ($n)" (Run $n (@("$T\probe.js") + $Urls) 120).Out 'upgrade Node.js to a patched release (>= 22.23.4 | 24.22.1 | 26.12.1)'
+  if ($NV) { Need "node ($n)" $v 1 'upgrade Node.js' @('22.23.4', '24.22.1', '26.12.1') }
   $npm = Join-Path (Split-Path $n) 'npm.cmd'
   if (Test-Path $npm) { Info "npm $(& $npm -v 2>$null) ($npm)" }
 }
@@ -418,17 +600,17 @@ foreach ($j in (Cands @('java.exe') $javaGlobs)) {
 }
 
 Hdr 'Go'
-foreach ($g in (Cands @('go.exe') @("$env:ProgramFiles\Go\bin\go.exe", "$env:USERPROFILE\sdk\go*\bin\go.exe"))) {
+foreach ($g in (Cands @('go.exe') @("$env:ProgramFiles\Go\bin\go.exe", "$env:USERPROFILE\sdk\go*\bin\go.exe", "$env:LOCALAPPDATA\mise\installs\go\*\bin\go.exe"))) {
   Need "go ($g)" (Ver (Run $g @('version') 30).Out) 2 'upgrade Go' @('1.27.3', '1.26.10')
 }
 
-Hdr 'Other tools'
-One 'uv' '0.13.4' 'uv self update' 'uv' @('--version')
-One 'pixi' '0.82.1' 'pixi self-update' 'pixi' @('--version')
-One 'rustup' '1.29.2' 'rustup self update' 'rustup' @('--version')
-One 'deno' '2.9.8' 'deno upgrade' 'deno' @('--version')
-One 'mise' '2026.10.17' 'mise self-update' 'mise' @('--version')
-One 'claude code' '2.1.303' 'claude update' 'claude' @('--version')
+Hdr 'Other tools (PATH and python envs)'
+Tool 'uv' '0.13.4' 'self update'
+Tool 'pixi' '0.82.1' 'self-update'
+Tool 'rustup' '1.29.2' 'self update'
+Tool 'deno' '2.9.8' 'upgrade'
+Tool 'mise' '2026.10.17' 'self-update'
+Tool 'claude' '2.1.303' 'update'
 if (Get-Command electron) { Need 'electron' ("$(& electron --version 2>$null)".Trim()) 1 'upgrade Electron' @('44.9.1', '43.8.1', '42.11.16') }
 if (Get-Command bun) { Warn "bun $(& bun --version): vendor fix pending" "watch $Ref; avoid bun for TLS to untrusted hosts" }
 if (Get-Command perl) {
@@ -451,12 +633,18 @@ foreach ($rc in "$env:USERPROFILE\.curlrc", "$env:APPDATA\_curlrc") {
   if (Select-String -Path $rc -Pattern '^\s*(-k|--insecure|insecure)' -Quiet) { Fail "$rc disables TLS verify" "remove insecure/-k from $rc" }
 }
 if (Get-Command git) {
-  if ((& git config --get http.sslVerify) -eq 'false') { Fail 'git http.sslVerify=false' 'git config --global --unset http.sslVerify' }
-  $c = & git config --get http.sslCAInfo
-  if ($c) { Bundle 'git http.sslCAInfo' $c 'update Git for Windows; or: git config --global http.sslBackend schannel' }
+  if ((& git config --bool --get http.sslVerify) -eq 'false') {
+    if ("$(& git config --show-scope --show-origin --get http.sslVerify)" -match '^global\tfile:([^"].*)\t') { Fail 'git http.sslVerify=false (global)' '' "git config --file $(Q $Matches[1]) --unset-all http.sslVerify" }
+    else { Fail 'git http.sslVerify=false' "remove it where 'git config --show-origin --get http.sslVerify' points" }
+  }
+  $c = & git config --path --get http.sslCAInfo
+  if ($c) { Bundle 'git http.sslCAInfo' $c 'point http.sslCAInfo to a patched bundle' }
 }
 if (Get-Command npm) {
-  if ((& npm config get strict-ssl 2>$null) -eq 'false') { Fail 'npm strict-ssl=false' 'npm config set strict-ssl true' }
+  if ((& npm config get strict-ssl 2>$null) -eq 'false') {
+    if (Select-String -Path "$(& npm config get userconfig 2>$null)" -Pattern '^\s*strict-ssl\s*=\s*false' -Quiet) { Fail 'npm strict-ssl=false (user config)' '' 'npm config set strict-ssl true; if ((npm config get strict-ssl) -ne ''true'') { throw ''strict-ssl is still false: another npmrc sets it (npm config ls -l)'' }' }
+    else { Fail 'npm strict-ssl=false' "remove strict-ssl=false from the npmrc that sets it ('npm config ls -l' shows the source)" }
+  }
   $c = & npm config get cafile 2>$null
   if ($c -and $c -notin 'null', 'undefined') { Bundle 'npm cafile' $c 'update npm cafile bundle' }
 }
@@ -467,44 +655,41 @@ if ($PyB) {
   if ($pc -match 'trusted-host') { Warn 'pip trusted-host set (TLS verify off for those hosts)' 'remove trusted-host from pip config' }
 }
 
-Hdr 'Browsers'
-$browsers = [ordered]@{
-  'Chrome'  = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-  'Edge'    = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
-  'Firefox' = "$env:ProgramFiles\Mozilla Firefox\firefox.exe", "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
-  'Brave'   = "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
-  'Opera'   = "$env:LOCALAPPDATA\Programs\Opera\opera.exe"
-  'Vivaldi' = "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe"
-}
-foreach ($b in $browsers.Keys) {
-  foreach ($p in $browsers[$b]) { if (Test-Path $p) { Info "$b $((Get-Item $p).VersionInfo.ProductVersion) ($p)" } }
+Hdr 'Browsers (not tested; see SUMMARY)'
+$pf86 = ${env:ProgramFiles(x86)}
+foreach ($b in (Cands @() @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "$pf86\Google\Chrome\Application\chrome.exe", "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+    "$pf86\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+    "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "$env:LOCALAPPDATA\Programs\Opera\opera.exe", "$env:LOCALAPPDATA\Programs\Opera GX\opera.exe",
+    "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe", "$env:ProgramFiles\Vivaldi\Application\vivaldi.exe", "$env:LOCALAPPDATA\Chromium\Application\chrome.exe",
+    "$env:ProgramFiles\Mozilla Firefox\firefox.exe", "$pf86\Mozilla Firefox\firefox.exe"))) {
+  $vi = (Get-Item -LiteralPath $b).VersionInfo
+  Info "$($vi.ProductName) $($vi.ProductVersion) ($b)"
 }
 
-Hdr 'Docker'
+Hdr 'Containers (docker, podman)'
 $dockerOk = $false
-$dd = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop'
-if ($dd.DisplayVersion) { Info "Docker Desktop $($dd.DisplayVersion): no patched version listed; keep it updated" }
-$docker = Get-Command docker.exe | Select-Object -First 1 -ExpandProperty Source
-if (-not $docker) { Info 'docker not installed' }
-else {
-  $sv = (Run $docker @('version', '--format', '{{.Server.Version}}') 20).Out.Trim()
-  $ostype = (Run $docker @('info', '--format', '{{.OSType}}') 20).Out.Trim()
-  if (-not $sv) { Warn 'docker daemon not reachable; images/containers not checked (start Docker Desktop, re-run)' }
-  elseif ($ostype -ne 'linux') { Warn "docker server $sv in $ostype-container mode; image test needs Linux containers" }
-  else {
-    $dockerOk = $true
-    Info "docker client $((Run $docker @('version', '--format', '{{.Client.Version}}') 20).Out.Trim()), server $sv"
-    $images = Lines (Run $docker @('images', '--format', '{{.Repository}}:{{.Tag}}') 30) | Where-Object { $_ -and $_ -notmatch '<none>' } | Sort-Object -Unique
-    if (-not $images) { Info 'no local images' }
-    foreach ($img in $images) {
-      Probe "image $img" (Lines (Run $docker (@('run', '--rm', '--pull=never', '--entrypoint', 'sh', $img, '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild/pull $img with updated ca-certificates"
-    }
-    $running = @(Lines (Run $docker @('ps', '--format', '{{.Names}}|{{.Image}}') 30) | Where-Object { $_ })
-    if (-not $running) { Info 'no running containers' }
-    foreach ($row in $running) {
-      $name, $img = $row -split '\|', 2
-      Probe "running container $name ($img)" (Lines (Run $docker (@('exec', $name, 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild $img with updated ca-certificates, then redeploy $name"
-    }
+$engines = @('docker.exe', 'podman.exe' | ForEach-Object { Get-Command $_ | Select-Object -First 1 -ExpandProperty Source })
+if (-not $engines) { Info 'docker/podman not installed' }
+foreach ($eng in $engines) {
+  $en = [IO.Path]::GetFileNameWithoutExtension($eng)
+  $ev = (Run $eng @('--version') 20).Out.Trim()
+  if ($en -eq 'docker' -and $ev -match 'podman') { continue }
+  $ostype = (Run $eng @('info', '--format', $(if ($en -eq 'docker') { '{{.OSType}}' } else { '{{.Host.OS}}' })) 30).Out.Trim()
+  if (-not $ostype) { Warn "${en}: engine not reachable; images/containers not checked (start it, re-run)"; continue }
+  if ($ostype -ne 'linux') { Warn "${en}: $ostype-container mode; image test needs Linux containers"; continue }
+  if ($en -eq 'docker') { $dockerOk = $true }
+  Info $ev
+  $images = Lines (Run $eng @('images', '--format', '{{.Repository}}:{{.Tag}}') 30) | Where-Object { $_ -and $_ -notmatch '<none>' } | Sort-Object -Unique
+  if (-not $images) { Info "${en}: no local images" }
+  foreach ($img in $images) {
+    Probe "$en image $img" (Lines (Run $eng (@('run', '--rm', '--pull=never', '--entrypoint', 'sh', $img, '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild/pull $img with updated ca-certificates"
+  }
+  $running = @(Lines (Run $eng @('ps', '--format', '{{.Names}}|{{.Image}}') 30) | Where-Object { $_ })
+  if (-not $running) { Info "${en}: no running containers" }
+  foreach ($row in $running) {
+    $name, $img = $row -split '\|', 2
+    Probe "$en container $name ($img)" (Lines (Run $eng (@('exec', $name, 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) "rebuild $img with updated ca-certificates, then redeploy $name"
   }
 }
 
@@ -522,7 +707,7 @@ else {
     Info ".wslconfig: $(if ($net) { ($net | ForEach-Object { $_.Trim() }) -join '; ' } else { 'no network settings' })"
   }
   Info 'WSL distros keep their own Linux CA store; Windows fixes do not apply inside them'
-  $linuxScript = Join-Path $PSScriptRoot 'check-linux.sh'
+  $linuxScript = Join-Path $PSScriptRoot 'check-unix.sh'
   $distros = @(Lines (Run $wsl @('-l', '-v') 30) | ForEach-Object { $_ -replace "`0", '' } | Select-Object -Skip 1 | Where-Object { $_.Trim() } | ForEach-Object {
     $f = ($_ -replace '^\s*\*?\s*', '') -split '\s+'
     [pscustomobject]@{ Name = $f[0]; State = $f[1]; Version = $f[2] }
@@ -538,12 +723,17 @@ else {
       Lines $r | ForEach-Object { Write-Host "  $_" }
       switch ($r.Code) {
         0 { Ok "WSL $($d.Name): no issues" }
-        1 { Fail "WSL $($d.Name): issues found (see its SUMMARY above)" 'apply the fixes listed inside that distro' }
+        1 {
+          $fixCmd = if ($r.Out -match 'Fix commands') { "wsl -d $(Q $d.Name) -e bash $(Q $p) --fix$(if ($dockerOk) { ' --no-docker' }); if (`$LASTEXITCODE -notin 0, 1, 2) { throw ""WSL fix run failed (exit `$LASTEXITCODE)"" }; `$global:LASTEXITCODE = 0" }
+          $step = "apply the manual steps listed for WSL $($d.Name) above"
+          Fail "WSL $($d.Name): issues found (see its SUMMARY above)" $step $fixCmd
+          if ($fixCmd -and $r.Out -match 'Manual steps') { Note "WSL $($d.Name): manual steps" $step }
+        }
         2 { Warn "WSL $($d.Name): some checks not verified (see its SUMMARY above)" }
-        default { Warn "WSL $($d.Name): check-linux.sh did not finish (code $($r.Code))" }
+        default { Warn "WSL $($d.Name): check-unix.sh did not finish (code $($r.Code))" }
       }
     } else {
-      Probe "WSL $($d.Name) default trust" (Lines (Run $wsl (@('-d', $d.Name, '-e', 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) 'inside distro: upgrade ca-certificates (apt/dnf/apk); full scan: put check-linux.sh next to this script'
+      Probe "WSL $($d.Name) default trust" (Lines (Run $wsl (@('-d', $d.Name, '-e', 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) 'inside distro: upgrade ca-certificates (apt/dnf/apk); full scan: put check-unix.sh next to this script'
     }
   }
 }
@@ -553,15 +743,40 @@ Remove-Item -Recurse -Force $T
 Hdr 'SUMMARY'
 if ($Issues.Count -eq 0 -and $Untested.Count -eq 0) { Write-Host 'No issues found; all checks verified.' -ForegroundColor Green }
 if ($Issues.Count -gt 0) {
-  Write-Host "$($Issues.Count) issue(s) to fix:" -ForegroundColor Red
-  $Issues | ForEach-Object { Write-Host " - $_" }
+  Write-Host "Issues ($($Issues.Count)):" -ForegroundColor Red
+  $Issues | ForEach-Object { Write-Host "  - $_" }
+}
+if ($Cmds.Count -gt 0) {
+  Write-Host "`nFix commands (run them, or re-run with -Fix):" -ForegroundColor Cyan
+  for ($i = 0; $i -lt $Cmds.Count; $i++) { Write-Host "  cmd $($i + 1): $($Cmds[$i])" }
+}
+if ($Steps.Count -gt 0) {
+  Write-Host "`nManual steps:" -ForegroundColor Cyan
+  for ($i = 0; $i -lt $Steps.Count; $i++) { Write-Host "  step $($i + 1): $($Steps[$i])" }
 }
 if ($Untested.Count -gt 0) {
-  Write-Host "$($Untested.Count) check(s) NOT verified (fix network/tooling and re-run, or check by hand):" -ForegroundColor Yellow
-  $Untested | ForEach-Object { Write-Host " - $_" }
+  Write-Host "`nNot verified ($($Untested.Count); fix network/tooling and re-run, or check by hand):" -ForegroundColor Yellow
+  $Untested | ForEach-Object { Write-Host "  - $_" }
 }
-Write-Host "Manual: in each browser open https://<host>-emudhra.we-have-a-problem.com/ for each host: $($TestHosts -join ' '). Each must show a certificate error."
-Write-Host 'Scope: images/containers/WSL fallback test only the first client found (curl > wget > python3). Not scanned: project deps (rustls-webpki, webpki-roots, castore, composer/ca-bundle), Electron apps.'
+Write-Host "`nBrowsers are not tested: open each URL below in each browser; all $NT must show a certificate error."
+$TestHosts | ForEach-Object { Write-Host "  https://$_-emudhra.we-have-a-problem.com/" }
+Write-Host "`nNot scanned: project deps (rustls-webpki, webpki-roots, castore, composer/ca-bundle), Electron apps; images/containers/WSL fallback test only their first client (curl > wget > python3)."
+if ($Fix -and $Cmds.Count -gt 0) {
+  Hdr 'FIX'
+  $fixFail = 0
+  for ($i = 0; $i -lt $Cmds.Count; $i++) {
+    Write-Host "`n+ cmd $($i + 1): $($Cmds[$i])"
+    $result = InvokeFix $Cmds[$i]
+    if ($result.Ok) { Ok "cmd $($i + 1)" }
+    else {
+      $reason = if ($result.Error) { $result.Error } else { "exit $($result.Code)" }
+      Write-Host "[FAIL] cmd $($i + 1): $reason" -ForegroundColor Red
+      $fixFail = 1
+    }
+  }
+  Write-Host "`nRe-run this script to verify the fixes."
+}
+if ($fixFail) { exit 3 }
 if ($Issues.Count -gt 0) { exit 1 }
 if ($Untested.Count -gt 0) { exit 2 }
 exit 0
