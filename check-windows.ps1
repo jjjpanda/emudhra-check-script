@@ -708,10 +708,15 @@ else {
   }
   Info 'WSL distros keep their own Linux CA store; Windows fixes do not apply inside them'
   $linuxScript = Join-Path $PSScriptRoot 'check-unix.sh'
-  $distros = @(Lines (Run $wsl @('-l', '-v') 30) | ForEach-Object { $_ -replace "`0", '' } | Select-Object -Skip 1 | Where-Object { $_.Trim() } | ForEach-Object {
-    $f = ($_ -replace '^\s*\*?\s*', '') -split '\s+'
-    [pscustomobject]@{ Name = $f[0]; State = $f[1]; Version = $f[2] }
-  })
+  $wslList = Run $wsl @('-l', '-v') 30
+  $distros = @()
+  if ($wslList.Code -eq 0) {
+    $distros = @(Lines $wslList | ForEach-Object { $_ -replace "`0", '' } | Select-Object -Skip 1 | Where-Object { $_.Trim() } | ForEach-Object {
+      $f = ($_ -replace '^\s*\*?\s*', '') -split '\s+'
+      [pscustomobject]@{ Name = $f[0]; State = $f[1]; Version = $f[2] }
+    })
+  }
+  if (-not $distros) { Info 'no WSL distros' }
   foreach ($d in $distros) {
     if ($d.Name -like 'docker-desktop*') { Info "$($d.Name): skipped (Docker Desktop internal)"; continue }
     Hdr "WSL distro: $($d.Name) (WSL$($d.Version), $($d.State))"

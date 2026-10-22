@@ -1,6 +1,13 @@
 name: Platform compatibility
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'check-*.sh'
+      - 'check-windows.ps1'
+      - '.github/scripts/**'
+      - '.github/workflows/compatibility.yml'
   pull_request:
     paths:
       - 'check-*.sh'
