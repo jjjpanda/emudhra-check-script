@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# eMudhra compromised-intermediate exposure check for Linux (also WSL distros).
+# eMudhra compromised-intermediate exposure check for Linux (also WSL distros) and macOS.
 # Ref: https://emudhra.we-have-a-problem.com/
 #
-# Usage:   bash check-linux.sh [--no-docker] [--fix]
+# Usage:   bash check-unix.sh [--no-docker] [--fix]
 # Method:  1) compare installed versions against the patched-version table
 #          2) live TLS test: each client connects to the 12 advisory test hosts
 #             (6 compromised TLS intermediates x 2 roots: emSign Root TLS G3 and the
 #             Sectigo "AAA Certificate Services" cross-sign) plus a control host.
 #             A patched client must REJECT all 12.
 #          Browsers are not driven; the SUMMARY gives a manual test.
+#          macOS: Safari has no headless mode; the system trust test covers its trust store.
 # Codes:   13 letters per client = 12 test hosts (order of TEST_HOSTS), then control (example.com)
 #          S = TLS accepted   C = rejected as untrusted/revoked   N = network/other error
 #          any S in the first 12 = FAIL;  CCCCCCCCCCCC + S = OK;  anything else = NOT VERIFIED
@@ -17,6 +18,14 @@
 #          commands that are known to be correct for how each item was installed).
 # Exit:    0 = no issues, 1 = issues found, 2 = no issues but some checks not verified;
 #          with --fix: 3 = a fix command failed; else the codes above, from the scan before the fixes (re-run to verify)
+# Note:    macOS: /usr/bin/python3, pip3 and git are skipped if Xcode Command Line Tools are
+#          missing (running them would open an install dialog). Runs on the system bash 3.2.
+
+case $(uname -s) in
+  Linux)  OS=linux; OSNAME=Linux ;;
+  Darwin) OS=mac; OSNAME=macOS ;;
+  *)      echo "unsupported OS: $(uname -s) (use check-windows.ps1 on Windows)" >&2; exit 2 ;;
+esac
 
 REF=https://emudhra.we-have-a-problem.com/
 TEST_HOSTS="dv-g3b dv-g3b-aaa dv-g3c dv-g3c-aaa ov-g3b ov-g3b-aaa ov-g3c ov-g3c-aaa ev-g3b ev-g3b-aaa ev-g3c ev-g3c-aaa"
@@ -32,7 +41,9 @@ STEPS=()
 TOOLFIX=()
 SEEN_BUNDLES='|'
 PYB=
+PKGUP=
 SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=
+CLT=1; [ $OS = mac ] && { xcode-select -p >/dev/null 2>&1 || CLT=0; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 ok()     { printf '[OK]   %s\n' "$*"; }
@@ -40,6 +51,12 @@ info()   { printf '[INFO] %s\n' "$*"; }
 fail()   { printf '[FAIL] %s\n' "$1"; note "$@"; }
 warn()   { printf '[WARN] %s\n' "$1"; if [ -n "${2:-}${3:-}" ]; then note "$@"; else UNTESTED+=("$1"); fi; }
 q()      { printf '%q' "$1"; }
+hdr()    { printf '\n== %s ==\n' "$*"; }
+have()   { command -v "$1" >/dev/null 2>&1; }
+ver()    { grep -Eo '[0-9]+(\.[0-9]+)+' | head -1; }
+kv()     { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+rp()     { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || perl -MCwd -e 'print Cwd::abs_path(shift), "\n"' "$1" 2>/dev/null || printf '%s\n' "$1"; }
+redact() { printf '%s' "$1" | sed -E 's#//[^/@]*@#//***@#'; }
 
 # note ISSUE STEP [CMD]: record an issue; CMD = command safe to run with --fix, else STEP is a manual step
 note() {
@@ -87,14 +104,8 @@ summary() {
   done
   echo; echo "Re-run this script to verify the fixes."
 }
-hdr()    { printf '\n== %s ==\n' "$*"; }
-have()   { command -v "$1" >/dev/null 2>&1; }
-ver()    { grep -Eo '[0-9]+(\.[0-9]+)+' | head -1; }
-kv()     { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
-rp()     { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || printf '%s\n' "$1"; }
-redact() { printf '%s' "$1" | sed -E 's#//[^/@]*@#//***@#'; }
 
-# to SECONDS CMD...: run CMD with a hard deadline
+# to SECONDS CMD...: run CMD with a hard deadline (macOS has no timeout(1) by default; perl alarm is the fallback)
 to() {
   if have timeout; then timeout "$@"
   elif have gtimeout; then gtimeout "$@"
@@ -205,31 +216,6 @@ pyfix() {
   esac
 }
 
-# bfix BUNDLE: set BS (manual step) / BC (command) that fix the package that ships BUNDLE (uses py, prefix, em, ps, pc)
-bfix() {
-  local o
-  BS=$ps; BC=$pc
-  case $1 in
-    /etc/*)      BS=$CAFIX; BC=$CACMD; return ;;
-    "$prefix"/*) [ "$prefix" = /usr ] || return ;;
-    "$HOME"/*)   BS="upgrade the user-site package that ships $1"; BC=$([ "$em" = 1 ] || echo "$(q "$py") -m pip install --user -U pip certifi"); return ;;
-  esac
-  [ "$prefix" = /usr ] || return
-  o=$(owner "$(rp "$1")")
-  if [ -n "$o" ]; then BS="upgrade distro package $o"; BC=${PKGUP:+$PKGUP $o}
-  else BS="upgrade pip/certifi that ship $1 (installed outside the package manager)"; BC=; fi
-}
-
-# by PATH: set FS (manual step) / FC (command) that fix the CA store used by the program at PATH
-by() {
-  local r b; r=$(rp "$1"); b=$(brewof "$r")
-  case $r in
-    */Cellar/*|*/.linuxbrew/*) FS=; FC="$b update && $b upgrade ca-certificates" ;;
-    /usr/*|/bin/*|/etc/*)    FS=$CAFIX; FC=$CACMD ;;
-    *)                       FS="update $1 or point it to a patched CA bundle"; FC= ;;
-  esac
-}
-
 # res LABEL CODES STEP [CMD]: CODES = one letter per test host, then the control host
 res() {
   local tests=${2%?} ctrl=${2#"${2%?}"} n
@@ -270,6 +256,7 @@ cands() {
   done | while IFS= read -r p; do
     [ -f "$p" ] && [ -x "$p" ] || continue
     case $p in */shims/*|*-config) continue ;; esac
+    case $p in /usr/bin/python3|/usr/bin/pip3|/usr/bin/git) [ $CLT = 1 ] || continue ;; esac
     if [ $links = 1 ]; then r=$p; else r=$(rp "$p"); fi
     case $seen in *"|$r|"*) continue ;; esac
     seen="$seen$r|"; printf '%s\n' "$p"
@@ -308,6 +295,23 @@ openssl_codes() {
   done
 }
 
+# macOS system trust (Security framework, as used by Safari / URLSession apps)
+# NSURLError (read from NSUnderlyingError when wrapped in a Cocoa error) -1202 untrusted, -1203 unknown root = C; others = N
+nsurl_codes() {
+  to 300 osascript -l JavaScript -e '
+    ObjC.import("Foundation");
+    function run(argv) {
+      return argv.map(function (u) {
+        var e = Ref();
+        var d = $.NSData.dataWithContentsOfURLOptionsError($.NSURL.URLWithString(u), 0, e);
+        if (!d.isNil()) return "S";
+        var ue = e[0].userInfo.objectForKey("NSUnderlyingError");
+        var c = (ue && !ue.isNil()) ? ue.code : e[0].code;
+        return (c == -1202 || c == -1203) ? "C" : "N";
+      }).join("");
+    }' $URLS 2>/dev/null </dev/null
+}
+
 # bundle LABEL FILE STEP [CMD]: live-test one PEM CA bundle file (once per real path)
 bundle() {
   local r
@@ -323,6 +327,177 @@ bundle() {
     warn "$1 ($2): no python3/curl to test bundle"
   fi
 }
+
+PY_NAMES=(python python3 python3.8 python3.9 python3.10 python3.11 python3.12 python3.13 python3.14)
+
+# Platform parts: os_store, os_bundles, browsers, by, bfix, py_steps, py_trust and the *_CANDS search lists.
+# by PATH: set FS (manual step) / FC (command) that fix the CA store used by the program at PATH
+# bfix BUNDLE KIND: set BS (manual step) / BC (command) that fix the package that ships BUNDLE
+#   (KIND = certifi|pip; uses py, prefix, em, ps, pc)
+# py_steps: set ps / pc, the default fix for pip and certifi in the env at prefix
+# py_trust: set FS / FC that fix the default trust of the python at py
+if [ $OS = linux ]; then
+  os_store() {
+    hdr "OS CA store"
+    [ -r /etc/os-release ] && . /etc/os-release
+    ID=${ID:-unknown}
+    info "${PRETTY_NAME:-$ID} ($(uname -r))"
+    grep -qi microsoft /proc/version 2>/dev/null && info "running in WSL"
+    CAPKG=ca-certificates
+    case " $ID ${ID_LIKE:-} " in
+      *" ubuntu "*|*" debian "*|*" devuan "*) PKGUP="$SUDO apt-get update && $SUDO apt-get install --only-upgrade -y" ;;
+      *" alpine "*)                          PKGUP="$SUDO apk upgrade -U" ;;
+      *" fedora "*|*" rhel "*|*" centos "*)  PKGUP="$SUDO dnf upgrade -y --refresh" ;;
+      *" arch "*)                            PKGUP="$SUDO pacman -Syu --needed"; CAPKG=ca-certificates-mozilla ;;
+      *" suse "*|*" opensuse "*)             PKGUP="$SUDO zypper -n up"; CAPKG=ca-certificates-mozilla ;;
+      *" gentoo "*)                          PKGUP="$SUDO emerge -u"; CAPKG=app-misc/ca-certificates ;;
+    esac
+    CACMD=${PKGUP:+$PKGUP $CAPKG}
+    CAFIX="distrust the emSign and AAA roots in the system CA store per $REF"
+    [ "$ID" = nixos ] && CAFIX="add both roots to security.pki.caCertificateBlacklist per $REF"
+  }
+  os_bundles() {
+    hdr "System CA bundles"
+    for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+      bundle "system bundle" "$f" "$CAFIX" "$CACMD"
+    done
+  }
+  browsers() {
+    for b in google-chrome chromium chromium-browser microsoft-edge brave-browser vivaldi opera firefox firefox-esr; do
+      have "$b" && info "$b $(to 30 "$b" --version 2>/dev/null </dev/null | ver)"
+    done
+  }
+  by() {
+    local r b; r=$(rp "$1"); b=$(brewof "$r")
+    case $r in
+      */Cellar/*|*/.linuxbrew/*) FS=; FC="$b update && $b upgrade ca-certificates" ;;
+      /usr/*|/bin/*|/etc/*)    FS=$CAFIX; FC=$CACMD ;;
+      *)                       FS="update $1 or point it to a patched CA bundle"; FC= ;;
+    esac
+  }
+  bfix() {
+    local o
+    BS=$ps; BC=$pc
+    case $1 in
+      /etc/*)      BS=$CAFIX; BC=$CACMD; return ;;
+      "$prefix"/*) [ "$prefix" = /usr ] || return ;;
+      "$HOME"/*)   BS="upgrade the user-site package that ships $1"; BC=$([ "$em" = 1 ] || echo "$(q "$py") -m pip install --user -U pip certifi"); return ;;
+    esac
+    [ "$prefix" = /usr ] || return
+    o=$(owner "$(rp "$1")")
+    if [ -n "$o" ]; then BS="upgrade distro package $o"; BC=${PKGUP:+$PKGUP $o}
+    else BS="upgrade pip/certifi that ship $1 (installed outside the package manager)"; BC=; fi
+  }
+  py_steps() {
+    if [ "$prefix" = /usr ]; then
+      ps=$CAFIX; pc=$CACMD
+    else
+      ps="upgrade pip and certifi in $prefix with the tool that manages it"
+      pc=$(pyfix "$py" "$prefix" "$em" "$(kv inst_certifi "$out")" 0 pip certifi)
+    fi
+  }
+  py_trust() { FS=$CAFIX; FC=$CACMD; }
+  CURL_CANDS=(curl)
+  GIT_CANDS=(git)
+  OPENSSL_CANDS=(openssl)
+  PY_PATHS=(/usr/bin/python3{,.[0-9]*} /usr/local/bin/python3{,.[0-9]*} /opt/python*/bin/python3
+    ~/.pyenv/versions/*/bin/python3 ~/.local/share/uv/python/*/bin/python3 ~/.rye/py/*/bin/python3
+    ~/.asdf/installs/python/*/bin/python3 ~/.local/share/mise/installs/python/*/bin/python3
+    ~/miniconda3/bin/python ~/anaconda3/bin/python ~/miniforge3/bin/python ~/mambaforge/bin/python ~/micromamba/bin/python /opt/conda/bin/python
+    ~/miniconda3/envs/*/bin/python ~/anaconda3/envs/*/bin/python ~/miniforge3/envs/*/bin/python ~/mambaforge/envs/*/bin/python
+    ~/micromamba/envs/*/bin/python ~/.conda/envs/*/bin/python /opt/conda/envs/*/bin/python ~/.pixi/envs/*/bin/python
+    ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python ~/.local/share/uv/tools/*/bin/python
+    ~/.virtualenvs/*/bin/python ~/.cache/pypoetry/virtualenvs/*/bin/python ~/.local/share/hatch/env/virtual/*/*/bin/python
+    /home/linuxbrew/.linuxbrew/bin/python3{,.[0-9]*})
+  NODE_CANDS=(node nodejs ~/.nvm/versions/node/*/bin/node ~/.volta/tools/image/node/*/bin/node
+    ~/.local/share/fnm/node-versions/*/installation/bin/node /usr/local/n/versions/node/*/bin/node
+    ~/.asdf/installs/nodejs/*/bin/node ~/.local/share/mise/installs/node/*/bin/node /home/linuxbrew/.linuxbrew/bin/node
+    ~/.nodenv/versions/*/bin/node ~/.local/share/pnpm/nodejs/*/bin/node /snap/bin/node)
+  JAVA_CANDS=(java ${JAVA_HOME:+"$JAVA_HOME/bin/java"} /usr/lib/jvm/*/bin/java /usr/java/*/bin/java /opt/java/*/bin/java
+    ~/.sdkman/candidates/java/*/bin/java ~/.jdks/*/bin/java ~/.asdf/installs/java/*/bin/java ~/.local/share/mise/installs/java/*/bin/java)
+  GO_CANDS=(go /usr/local/go/bin/go /usr/lib/go/bin/go ~/sdk/go*/bin/go ~/.local/share/mise/installs/go/*/bin/go
+    ~/.asdf/installs/golang/*/go/bin/go /snap/bin/go)
+else
+  OSFIX="install latest macOS updates (System Settings > General > Software Update)"
+  CERTPEM_FIX="back up /etc/ssl/cert.pem, remove 'AAA Certificate Services' and 'emSign ECC Root CA - G3' from it (see $REF)"
+  BREWCA="brew update && brew upgrade ca-certificates"
+  os_store() {
+    hdr "macOS"
+    info "macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion) ($(uname -m))"
+    [ $CLT = 1 ] && info "Xcode CLT: $(xcode-select -p)" || info "Xcode CLT not installed; /usr/bin python3/pip3/git skipped"
+    res "macOS system trust (Safari, URLSession apps)" "$(nsurl_codes)" "$OSFIX"
+  }
+  os_bundles() {
+    hdr "CA bundles"
+    bundle "/etc/ssl/cert.pem (system curl/git/python3/perl/ruby/openssl)" /etc/ssl/cert.pem "$CERTPEM_FIX"
+    if have brew; then
+      BP=$(brew --prefix)
+      for f in "$BP"/etc/ca-certificates/cert.pem "$BP"/etc/openssl@3/cert.pem "$BP"/etc/openssl@1.1/cert.pem "$BP"/etc/openssl/cert.pem; do
+        bundle "Homebrew bundle" "$f" "" "$BREWCA"
+      done
+    fi
+    for f in /opt/local/share/curl/curl-ca-bundle.crt /opt/local/etc/openssl/cert.pem; do
+      bundle "MacPorts bundle" "$f" "" "sudo port selfupdate && sudo port upgrade curl-ca-bundle"
+    done
+    [ -d /nix ] && info "Nix present: nix-darwin users also follow the NixOS steps at $REF"
+  }
+  browsers() {
+    for a in Safari "Google Chrome" Chromium "Microsoft Edge" "Brave Browser" Opera Vivaldi Arc Firefox; do
+      [ -d "/Applications/$a.app" ] && info "$a $(defaults read "/Applications/$a.app/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+    done
+  }
+  by() {
+    local r b; r=$(rp "$1"); b=$(brewof "$r")
+    case $r in
+      */Cellar/*|/opt/homebrew/*) FS=; FC="$b update && $b upgrade ca-certificates" ;;
+      /usr/*|/bin/*|/etc/*|/Library/Developer/*|/Applications/Xcode*) FS=$CERTPEM_FIX; FC= ;;
+      /opt/local/*)            FS=; FC="sudo port selfupdate && sudo port upgrade curl-ca-bundle" ;;
+      *)                       FS="update $1 or point it to a patched CA bundle"; FC= ;;
+    esac
+  }
+  bfix() {
+    BS=$ps; BC=$pc
+    [ "$2" = pip ] && return
+    case $1 in "$prefix"/*) ;; "$HOME"/*) BS="upgrade the user-site certifi ($1)"; BC=$([ "$em" = 1 ] || echo "$(q "$py") -m pip install --user -U certifi") ;; esac
+  }
+  py_steps() {
+    case $prefix in
+      /Library/Developer/*|/Applications/Xcode*|/System/*)
+        ps="$CERTPEM_FIX; set PIP_CERT=/etc/ssl/cert.pem via sitecustomize.py (see $REF)"; pc= ;;
+      *) ps="upgrade pip and certifi in $prefix"; pc=$(pyfix "$py" "$prefix" "$em" "$(kv inst_certifi "$out")" 0 pip certifi) ;;
+    esac
+  }
+  py_trust() {
+    case $prefix in
+      /Library/Frameworks/*) FS=; FC=$(q "/Applications/Python ${v%.*}/Install Certificates.command") ;;
+      *) by "$py" ;;
+    esac
+    [ -n "$ts" ] && { FS=$OSFIX; FC=; }
+  }
+  CURL_CANDS=(curl /opt/homebrew/opt/curl/bin/curl /usr/local/opt/curl/bin/curl /opt/local/bin/curl)
+  GIT_CANDS=(git /opt/homebrew/bin/git /usr/local/bin/git)
+  OPENSSL_CANDS=(openssl /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl)
+  PY_PATHS=(/usr/bin/python3 /opt/homebrew/bin/python3{,.[0-9]*} /usr/local/bin/python3{,.[0-9]*} /opt/homebrew/opt/python@*/bin/python3
+    /Library/Frameworks/Python.framework/Versions/*/bin/python3 /opt/local/bin/python3{,.[0-9]*}
+    ~/.pyenv/versions/*/bin/python3 ~/.local/share/uv/python/*/bin/python3 ~/.rye/py/*/bin/python3
+    ~/.asdf/installs/python/*/bin/python3 ~/.local/share/mise/installs/python/*/bin/python3
+    ~/miniconda3/bin/python ~/anaconda3/bin/python ~/miniforge3/bin/python ~/mambaforge/bin/python ~/micromamba/bin/python
+    /opt/miniconda3/bin/python /opt/anaconda3/bin/python /opt/homebrew/Caskroom/miniforge/base/bin/python
+    ~/miniconda3/envs/*/bin/python ~/anaconda3/envs/*/bin/python ~/miniforge3/envs/*/bin/python /opt/miniconda3/envs/*/bin/python
+    ~/mambaforge/envs/*/bin/python ~/micromamba/envs/*/bin/python ~/.conda/envs/*/bin/python ~/.pixi/envs/*/bin/python
+    ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python ~/.local/share/uv/tools/*/bin/python
+    ~/.virtualenvs/*/bin/python ~/Library/Caches/pypoetry/virtualenvs/*/bin/python
+    "$HOME/Library/Application Support/hatch/env/virtual"/*/*/bin/python)
+  NODE_CANDS=(node ~/.nvm/versions/node/*/bin/node ~/.volta/tools/image/node/*/bin/node
+    ~/.local/share/fnm/node-versions/*/installation/bin/node "$HOME/Library/Application Support/fnm/node-versions"/*/installation/bin/node
+    /usr/local/n/versions/node/*/bin/node ~/.asdf/installs/nodejs/*/bin/node ~/.local/share/mise/installs/node/*/bin/node
+    /opt/homebrew/opt/node*/bin/node /usr/local/opt/node*/bin/node ~/.nodenv/versions/*/bin/node
+    "$HOME/Library/pnpm/nodejs"/*/bin/node)
+  JAVA_CANDS=(${JAVA_HOME:+"$JAVA_HOME/bin/java"} /Library/Java/JavaVirtualMachines/*/Contents/Home/bin/java
+    ~/Library/Java/JavaVirtualMachines/*/Contents/Home/bin/java /opt/homebrew/opt/openjdk*/bin/java /usr/local/opt/openjdk*/bin/java
+    ~/.sdkman/candidates/java/*/bin/java ~/.jdks/*/bin/java ~/.local/share/mise/installs/java/*/bin/java)
+  GO_CANDS=(go /usr/local/go/bin/go ~/sdk/go*/bin/go /opt/homebrew/opt/go*/bin/go ~/.local/share/mise/installs/go/*/bin/go)
+fi
 
 cat > "$T/probe.py" <<'EOF'
 import sys, ssl
@@ -412,55 +587,35 @@ read -r -d '' IMG_SH <<'EOF'
 r(){ case $* in *'local issuer'*|*'issuer certificate'*|*'self-signed certificate in'*|*'self signed certificate in'*|*'locally verify'*|*'unable to verify the first'*|*revoked*|*REVOKED*|*UNTRUSTED*|*'not trusted'*|*'server certificate verification failed'*) printf C;; *) printf N;; esac; }; t(){ if command -v curl >/dev/null 2>&1; then T=curl; e=$(curl -sS -o /dev/null -m 15 $1 2>&1) && printf S || r $e; elif command -v wget >/dev/null 2>&1; then T=wget; e=$(wget -q -T 15 -O /dev/null $1 2>&1); c=$?; if [ $c = 0 ] || [ $c = 8 ]; then printf S; else r $e; fi; elif command -v python3 >/dev/null 2>&1; then T=python3; e=$(python3 -c 'import sys,urllib.request as u;u.urlopen(sys.argv[1],timeout=15)' $1 2>&1); c=$?; if [ $c = 0 ] || echo $e | grep -q HTTPError; then printf S; else r $e; fi; else T=none; printf X; fi; }; for u; do t $u; done; echo; echo $( (dpkg-query -W -f='${Version}' ca-certificates || apk info -v ca-certificates || rpm -q ca-certificates) 2>/dev/null | head -1); echo $T
 EOF
 
-echo "eMudhra CA exposure check (Linux) - ref: $REF"
+echo "eMudhra CA exposure check ($OSNAME) - ref: $REF"
 echo "Codes: $NT test hosts ($TEST_HOSTS) + control; S=TLS accepted, C=rejected untrusted/revoked, N=other error"
 
-hdr "OS CA store"
-[ -r /etc/os-release ] && . /etc/os-release
-ID=${ID:-unknown}
-info "${PRETTY_NAME:-$ID} ($(uname -r))"
-grep -qi microsoft /proc/version 2>/dev/null && info "running in WSL"
-
-PKGUP=; CAPKG=ca-certificates
-case " $ID ${ID_LIKE:-} " in
-  *" ubuntu "*|*" debian "*|*" devuan "*) PKGUP="$SUDO apt-get update && $SUDO apt-get install --only-upgrade -y" ;;
-  *" alpine "*)                          PKGUP="$SUDO apk upgrade -U" ;;
-  *" fedora "*|*" rhel "*|*" centos "*)  PKGUP="$SUDO dnf upgrade -y --refresh" ;;
-  *" arch "*)                            PKGUP="$SUDO pacman -Syu --needed"; CAPKG=ca-certificates-mozilla ;;
-  *" suse "*|*" opensuse "*)             PKGUP="$SUDO zypper -n up"; CAPKG=ca-certificates-mozilla ;;
-  *" gentoo "*)                          PKGUP="$SUDO emerge -u"; CAPKG=app-misc/ca-certificates ;;
-esac
-CACMD=${PKGUP:+$PKGUP $CAPKG}
-CAFIX="distrust the emSign and AAA roots in the system CA store per $REF"
-[ "$ID" = nixos ] && CAFIX="add both roots to security.pki.caCertificateBlacklist per $REF"
+os_store
 
 hdr "Tools for bundle tests"
 for py in $(cands python3 python); do "$py" -c 'import ssl; ssl.create_default_context' 2>/dev/null </dev/null && { PYB=$py; break; }; done
 CURL1=$(cands curl | head -1)
 info "bundle tester: ${PYB:-${CURL1:-none}}"
 
-hdr "System CA bundles"
-for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
-  bundle "system bundle" "$f" "$CAFIX" "$CACMD"
-done
+os_bundles
 
 hdr "curl"
 while IFS= read -r c <&3; do
   info "$("$c" --version 2>/dev/null </dev/null | head -1) ($c)"
   by "$c"; res "curl ($c)" "$(curl_codes "$c")" "$FS" "$FC"
-done 3< <(cands curl)
+done 3< <(cands "${CURL_CANDS[@]}")
 
 hdr "git"
 while IFS= read -r g <&3; do
   info "$("$g" --version 2>/dev/null </dev/null) ($g)"
   by "$g"; res "git ls-remote ($g)" "$(git_codes "$g")" "$FS" "$FC"
-done 3< <(cands git)
+done 3< <(cands "${GIT_CANDS[@]}")
 
 hdr "openssl"
 while IFS= read -r o <&3; do
   info "$("$o" version 2>/dev/null </dev/null) ($o)"
   by "$o"; res "openssl s_client ($o)" "$(openssl_codes "$o")" "$FS" "$FC"
-done 3< <(cands openssl)
+done 3< <(cands "${OPENSSL_CANDS[@]}")
 
 hdr "Python / pip / certifi"
 CONDA=$(for m in conda mamba micromamba; do have $m && { echo $m; break; }; done)
@@ -473,12 +628,7 @@ while IFS= read -r py <&3; do
   out=$(to 600 "$py" "$T/probe.py" $URLS 2>/dev/null </dev/null)
   v=$(kv ver "$out"); em=$(kv em "$out"); ts=$(kv ts "$out")
   [ -z "$(kv sys "$out")" ] && { warn "python ${v:-?} ($py): too old to test or probe failed"; continue; }
-  if [ "$prefix" = /usr ]; then
-    ps=$CAFIX; pc=$CACMD
-  else
-    ps="upgrade pip and certifi in $prefix with the tool that manages it"
-    pc=$(pyfix "$py" "$prefix" "$em" "$(kv inst_certifi "$out")" 0 pip certifi)
-  fi
+  py_steps
   case $prefix in
     "$HOME"/.pixi/envs/*) ec="pixi global update $(basename "$prefix")" ;;
     *)                    ec=${CONDA:+$CONDA update -y -p $(q "$prefix") ca-certificates certifi openssl} ;;
@@ -486,53 +636,40 @@ while IFS= read -r py <&3; do
   if [ -z "$ts" ] && [ -d "$prefix/conda-meta" ]; then
     res "python $v ($py) default trust${ts:+ (truststore)}" "$(kv sys "$out")" "update ca-certificates, certifi and openssl in $prefix" "$ec"
   else
-    res "python $v ($py) default trust${ts:+ (truststore)}" "$(kv sys "$out")" "$CAFIX" "$CACMD"
+    py_trust
+    res "python $v ($py) default trust${ts:+ (truststore)}" "$(kv sys "$out")" "$FS" "$FC"
   fi
   c=$(kv certifi "$out")
   if [ -n "$c" ]; then
     rest=${c#*|}; cp=${rest%|*}
-    bfix "$cp"; res "certifi ${c%%|*} bundle ($cp)" "${rest##*|}" "$BS" "$BC"
+    bfix "$cp" certifi; res "certifi ${c%%|*} bundle ($cp)" "${rest##*|}" "$BS" "$BC"
     SEEN_BUNDLES="$SEEN_BUNDLES$(rp "$cp")|"
   fi
   c=$(kv pipcertifi "$out")
-  [ -n "$c" ] && { rest=${c#*|}; bfix "${rest%|*}"; res "pip vendored certifi ${c%%|*} ($py)" "${rest##*|}" "$BS" "$BC"; }
+  [ -n "$c" ] && { rest=${c#*|}; bfix "${rest%|*}" pip; res "pip vendored certifi ${c%%|*} ($py)" "${rest##*|}" "$BS" "$BC"; }
   while IFS='|' read -r tp ti tu; do
     [ -n "$tp" ] && TOOLFIX+=("$tp|$(pyfix "$py" "$prefix" "$em" "$ti" "$tu" "$(basename "$tp")")")
   done < <(printf '%s\n' "$out" | sed -n 's/^tool=//p')
-done 3< <(cands --keep-links python python3 python3.8 python3.9 python3.10 python3.11 python3.12 python3.13 python3.14 \
-  /usr/bin/python3{,.[0-9]*} /usr/local/bin/python3{,.[0-9]*} /opt/python*/bin/python3 \
-  ~/.pyenv/versions/*/bin/python3 ~/.local/share/uv/python/*/bin/python3 ~/.rye/py/*/bin/python3 \
-  ~/.asdf/installs/python/*/bin/python3 ~/.local/share/mise/installs/python/*/bin/python3 \
-  ~/miniconda3/bin/python ~/anaconda3/bin/python ~/miniforge3/bin/python ~/mambaforge/bin/python ~/micromamba/bin/python /opt/conda/bin/python \
-  ~/miniconda3/envs/*/bin/python ~/anaconda3/envs/*/bin/python ~/miniforge3/envs/*/bin/python ~/mambaforge/envs/*/bin/python \
-  ~/micromamba/envs/*/bin/python ~/.conda/envs/*/bin/python /opt/conda/envs/*/bin/python ~/.pixi/envs/*/bin/python \
-  ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python ~/.local/share/uv/tools/*/bin/python \
-  ~/.virtualenvs/*/bin/python ~/.cache/pypoetry/virtualenvs/*/bin/python ~/.local/share/hatch/env/virtual/*/*/bin/python \
-  /home/linuxbrew/.linuxbrew/bin/python3{,.[0-9]*})
+done 3< <(cands --keep-links "${PY_NAMES[@]}" "${PY_PATHS[@]}")
 
 hdr "Node.js / npm"
 while IFS= read -r n <&3; do
   v=$("$n" -v 2>/dev/null </dev/null) || continue
   res "node $v ($n)" "$(to 120 "$n" "$T/probe.js" $URLS 2>/dev/null </dev/null)" "upgrade Node.js to a patched release (>= 22.23.4 | 24.22.1 | 26.12.1)"
   [ -x "$(dirname "$n")/npm" ] && info "npm $("$(dirname "$n")/npm" -v 2>/dev/null </dev/null) ($(dirname "$n")/npm)"
-done 3< <(cands node nodejs ~/.nvm/versions/node/*/bin/node ~/.volta/tools/image/node/*/bin/node \
-  ~/.local/share/fnm/node-versions/*/installation/bin/node /usr/local/n/versions/node/*/bin/node \
-  ~/.asdf/installs/nodejs/*/bin/node ~/.local/share/mise/installs/node/*/bin/node /home/linuxbrew/.linuxbrew/bin/node \
-  ~/.nodenv/versions/*/bin/node ~/.local/share/pnpm/nodejs/*/bin/node /snap/bin/node)
+done 3< <(cands "${NODE_CANDS[@]}")
 
 hdr "Java"
 while IFS= read -r j <&3; do
   jv=$(to 30 "$j" -version 2>&1 </dev/null | sed -nE 's/.*version "([^"]+)".*/\1/p' | head -1)
   case $jv in 1.*) jv=${jv#1.}; jv=${jv/_/.} ;; esac
   need "java ($j)" "$jv" 1 "upgrade JDK" 27.0.1.0.2 25.0.5.0.2 21.0.13.0.2 17.0.21.0.2 11.0.33.0.2 8.0.511
-done 3< <(cands java ${JAVA_HOME:+"$JAVA_HOME/bin/java"} /usr/lib/jvm/*/bin/java /usr/java/*/bin/java /opt/java/*/bin/java \
-  ~/.sdkman/candidates/java/*/bin/java ~/.jdks/*/bin/java ~/.asdf/installs/java/*/bin/java ~/.local/share/mise/installs/java/*/bin/java)
+done 3< <(cands "${JAVA_CANDS[@]}")
 
 hdr "Go"
 while IFS= read -r g <&3; do
   need "go ($g)" "$("$g" version 2>/dev/null </dev/null | ver)" 2 "upgrade Go" 1.27.3 1.26.10
-done 3< <(cands go /usr/local/go/bin/go /usr/lib/go/bin/go ~/sdk/go*/bin/go ~/.local/share/mise/installs/go/*/bin/go \
-  ~/.asdf/installs/golang/*/go/bin/go /snap/bin/go)
+done 3< <(cands "${GO_CANDS[@]}")
 
 hdr "Other tools (PATH and python envs)"
 tool uv 0.13.4 "self update"
@@ -557,14 +694,15 @@ done
 [ "${PYTHONHTTPSVERIFY:-}" = 0 ] && fail "PYTHONHTTPSVERIFY=0 disables TLS verify" "unset PYTHONHTTPSVERIFY"
 [ -n "${GIT_SSL_NO_VERIFY:-}" ] && fail "GIT_SSL_NO_VERIFY set" "unset GIT_SSL_NO_VERIFY"
 grep -Eqs '^[[:space:]]*(-k|--insecure|insecure)' ~/.curlrc && fail "~/.curlrc disables TLS verify" "remove insecure/-k from ~/.curlrc"
-if have git; then
-  if [ "$(git config --bool --get http.sslVerify)" = false ]; then
-    case $(git config --show-scope --get http.sslVerify 2>/dev/null) in
+GIT1=$(cands "${GIT_CANDS[@]}" | head -1)
+if [ -n "$GIT1" ]; then
+  if [ "$("$GIT1" config --bool --get http.sslVerify)" = false ]; then
+    case $("$GIT1" config --show-scope --get http.sslVerify 2>/dev/null) in
       global*) fail "git http.sslVerify=false (global)" "" "git config --global --unset-all http.sslVerify" ;;
       *)       fail "git http.sslVerify=false" "remove it where 'git config --show-origin --get http.sslVerify' points" ;;
     esac
   fi
-  c=$(git config --get http.sslCAInfo) && bundle "git http.sslCAInfo" "$c" "point http.sslCAInfo to a patched bundle"
+  c=$("$GIT1" config --get http.sslCAInfo) && bundle "git http.sslCAInfo" "$c" "point http.sslCAInfo to a patched bundle"
 fi
 if have npm; then
   if [ "$(to 30 npm config get strict-ssl 2>/dev/null)" = false ]; then
@@ -583,9 +721,7 @@ if [ -n "$PYB" ]; then
 fi
 
 hdr "Browsers (not tested; see SUMMARY)"
-for b in google-chrome chromium chromium-browser microsoft-edge brave-browser vivaldi opera firefox firefox-esr; do
-  have "$b" && info "$b $(to 30 "$b" --version 2>/dev/null </dev/null | ver)"
-done
+browsers
 
 hdr "Containers (docker, podman)"
 if [ $NO_DOCKER = 1 ]; then

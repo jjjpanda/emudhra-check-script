@@ -14,7 +14,7 @@
   Codes:   13 letters per client = 12 test hosts (order of $TestHosts), then control (example.com)
            S = TLS accepted   C = rejected as untrusted/revoked   N = network/other error
            any S in the first 12 = FAIL;  CCCCCCCCCCCC + S = OK;  anything else = NOT VERIFIED
-  WSL:     each distro is scanned with check-linux.sh if it sits next to this script,
+  WSL:     each distro is scanned with check-unix.sh if it sits next to this script,
            else with a short built-in probe (curl/wget/python3 + ca-certificates version).
   Output:  [OK] / [INFO] / [WARN] / [FAIL] lines, then a SUMMARY: issues, fix commands, manual steps.
   -Fix:    after the checks, run the fix commands (only package-manager / self-update
@@ -622,7 +622,7 @@ else {
     Info ".wslconfig: $(if ($net) { ($net | ForEach-Object { $_.Trim() }) -join '; ' } else { 'no network settings' })"
   }
   Info 'WSL distros keep their own Linux CA store; Windows fixes do not apply inside them'
-  $linuxScript = Join-Path $PSScriptRoot 'check-linux.sh'
+  $linuxScript = Join-Path $PSScriptRoot 'check-unix.sh'
   $distros = @(Lines (Run $wsl @('-l', '-v') 30) | ForEach-Object { $_ -replace "`0", '' } | Select-Object -Skip 1 | Where-Object { $_.Trim() } | ForEach-Object {
     $f = ($_ -replace '^\s*\*?\s*', '') -split '\s+'
     [pscustomobject]@{ Name = $f[0]; State = $f[1]; Version = $f[2] }
@@ -643,10 +643,10 @@ else {
           Fail "WSL $($d.Name): issues found (see its SUMMARY above)" "apply the manual steps listed for WSL $($d.Name) above" $fixCmd
         }
         2 { Warn "WSL $($d.Name): some checks not verified (see its SUMMARY above)" }
-        default { Warn "WSL $($d.Name): check-linux.sh did not finish (code $($r.Code))" }
+        default { Warn "WSL $($d.Name): check-unix.sh did not finish (code $($r.Code))" }
       }
     } else {
-      Probe "WSL $($d.Name) default trust" (Lines (Run $wsl (@('-d', $d.Name, '-e', 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) 'inside distro: upgrade ca-certificates (apt/dnf/apk); full scan: put check-linux.sh next to this script'
+      Probe "WSL $($d.Name) default trust" (Lines (Run $wsl (@('-d', $d.Name, '-e', 'sh', '-c', $ImgSh, 'sh') + $Urls) 300)) 'inside distro: upgrade ca-certificates (apt/dnf/apk); full scan: put check-unix.sh next to this script'
     }
   }
 }
