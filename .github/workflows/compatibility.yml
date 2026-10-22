@@ -66,18 +66,18 @@ jobs:
       matrix:
         shell: [powershell, pwsh]
     runs-on: windows-2025
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Test Windows fix planning and failure handling
-        shell: ${{ matrix.shell }}
         run: ./.github/scripts/test_windows_fixes.ps1
       - name: Scan without fixes
         shell: pwsh
-        env:
-          SCAN_SHELL: ${{ matrix.shell }}
-        run: python .github/scripts/run_scan.py --windows-shell $env:SCAN_SHELL
+        run: python .github/scripts/run_scan.py --windows-shell ${{ matrix.shell }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
