@@ -456,7 +456,8 @@ foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
   $ca = (Run $g @('config', '--get', 'http.sslCAInfo') 15).Out.Trim()
   $root = $g -replace '\\(cmd|bin|(mingw64|ucrt64)\\bin)\\git\.exe$'
   $own = $ca -and ($GitBundles | ForEach-Object { "$root\$_" }) -contains [IO.Path]::GetFullPath($ca)
-  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and (-not $ca -or $own)) { "& $(Q $g) config --global http.sslBackend schannel" }
+  $custom = $env:GIT_SSL_CAINFO -or $env:GIT_SSL_CAPATH -or (Run $g @('config', '--get-regexp', '^http\.(.+\.sslcainfo|(.+\.)?sslcapath)$') 15).Out.Trim()
+  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and -not $custom -and (-not $ca -or $own)) { "& $(Q $g) config --global http.sslBackend schannel" }
   Res "git ls-remote ($g)" (GitCodes $g) $fx $cmd
 }
 
