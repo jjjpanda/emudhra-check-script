@@ -58,8 +58,9 @@ function Kv($lines, $key) { (@($lines) | Where-Object { "$_" -like "$key=*" } | 
 function Lines($result) { @("$($result.Out)" -split "`r?`n") }
 function Redact($s) { "$s" -replace '//[^/@]*@', '//***@' }
 
-# Rejected: true only for untrusted-issuer / revoked errors (not generic TLS or network errors)
-function Rejected($msg) { "$msg" -match 'local issuer|issuer certificate|self.signed certificate in|locally verify|unable to verify the first|revoked|untrusted|not trusted' }
+# Rejected: true only for untrusted-issuer / revoked errors (not generic TLS or network errors).
+# GnuTLS clients only say "server certificate verification failed"; the test hosts are otherwise valid.
+function Rejected($msg) { "$msg" -match 'local issuer|issuer certificate|self.signed certificate in|locally verify|unable to verify the first|revoked|untrusted|not trusted|server certificate verification failed' }
 
 # Run: start a native exe with a hard deadline; returns .Out, .Err, .Code (-1 = timed out, -2 = could not start)
 function Run($exe, [string[]]$arguments, [int]$sec = 60) {
@@ -223,6 +224,22 @@ except ImportError:
     print("ver=" + sys.version.split()[0]); sys.exit()
 VerifyError = getattr(ssl, "SSLCertVerificationError", None)
 REJECT = (2, 19, 20, 21, 23, 28)  # issuer unknown/untrusted, self-signed in chain, revoked, rejected
+# truststore (e.g. injected from sitecustomize) verifies with the OS and reports its codes instead: Windows
+# CRYPT_E_REVOKED, CERT_E_UNTRUSTEDROOT, CERT_E_CHAINING, CERT_E_REVOKED, TRUST_E_EXPLICIT_DISTRUST
+OS_REJECT = (0x80092010, 0x800B0109, 0x800B010A, 0x800B010C, 0x800B0111)
+OS_REJECT_MSG = ("revoked", "not trusted", "untrusted", "distrust")
+TRUSTSTORE = ssl.SSLContext.__module__.startswith("truststore")
+def rejected(r):
+    if r.verify_code in REJECT:
+        return True
+    if not TRUSTSTORE:
+        return False
+    return r.verify_code in OS_REJECT or any(s in str(r.verify_message or r).lower() for s in OS_REJECT_MSG)
+def plain():
+    # CA file tests must use OpenSSL with only that file, not the OS verifier truststore injects
+    global TRUSTSTORE
+    if TRUSTSTORE:
+        import truststore; truststore.extract_from_ssl(); TRUSTSTORE = False
 def codes(urls, cafile=None):
     out = ""
     for u in urls:
@@ -233,15 +250,18 @@ def codes(urls, cafile=None):
         except Exception as e:
             r = getattr(e, "reason", e)
             if VerifyError and isinstance(r, VerifyError):
-                out += "C" if r.verify_code in REJECT else "N"
+                out += "C" if rejected(r) else "N"
             else:
                 out += "C" if "CERTIFICATE_VERIFY_FAILED" in str(r) else "N"
     return out
 args = sys.argv[1:]
 if args[:1] == ["--cafile"]:
-    print(codes(args[2:], args[1])); sys.exit()
+    plain(); print(codes(args[2:], args[1])); sys.exit()
 print("ver=" + sys.version.split()[0])
+if TRUSTSTORE:
+    print("ts=1")
 print("sys=" + codes(args))
+plain()
 for key, mod in (("certifi", "certifi"), ("pipcertifi", "pip._vendor.certifi")):
     try:
         m = __import__(mod, fromlist=["where"])
@@ -272,7 +292,7 @@ urls.forEach((u, i) => {
 # Prints 3 lines: codes, ca-certificates version, client used (first of curl, wget, python3)
 # (no double quotes inside: Windows argument quoting would mangle them)
 $ImgSh = @'
-r(){ case $* in *'local issuer'*|*'issuer certificate'*|*'self-signed certificate in'*|*'self signed certificate in'*|*'locally verify'*|*'unable to verify the first'*|*revoked*|*REVOKED*|*UNTRUSTED*|*'not trusted'*) printf C;; *) printf N;; esac; }; t(){ if command -v curl >/dev/null 2>&1; then T=curl; e=$(curl -sS -o /dev/null -m 15 $1 2>&1) && printf S || r $e; elif command -v wget >/dev/null 2>&1; then T=wget; e=$(wget -q -T 15 -O /dev/null $1 2>&1); c=$?; if [ $c = 0 ] || [ $c = 8 ]; then printf S; else r $e; fi; elif command -v python3 >/dev/null 2>&1; then T=python3; e=$(python3 -c 'import sys,urllib.request as u;u.urlopen(sys.argv[1],timeout=15)' $1 2>&1); c=$?; if [ $c = 0 ] || echo $e | grep -q HTTPError; then printf S; else r $e; fi; else T=none; printf X; fi; }; for u; do t $u; done; echo; echo $( (dpkg-query -W -f='${Version}' ca-certificates || apk info -v ca-certificates || rpm -q ca-certificates) 2>/dev/null | head -1); echo $T
+r(){ case $* in *'local issuer'*|*'issuer certificate'*|*'self-signed certificate in'*|*'self signed certificate in'*|*'locally verify'*|*'unable to verify the first'*|*revoked*|*REVOKED*|*UNTRUSTED*|*'not trusted'*|*'server certificate verification failed'*) printf C;; *) printf N;; esac; }; t(){ if command -v curl >/dev/null 2>&1; then T=curl; e=$(curl -sS -o /dev/null -m 15 $1 2>&1) && printf S || r $e; elif command -v wget >/dev/null 2>&1; then T=wget; e=$(wget -q -T 15 -O /dev/null $1 2>&1); c=$?; if [ $c = 0 ] || [ $c = 8 ]; then printf S; else r $e; fi; elif command -v python3 >/dev/null 2>&1; then T=python3; e=$(python3 -c 'import sys,urllib.request as u;u.urlopen(sys.argv[1],timeout=15)' $1 2>&1); c=$?; if [ $c = 0 ] || echo $e | grep -q HTTPError; then printf S; else r $e; fi; else T=none; printf X; fi; }; for u; do t $u; done; echo; echo $( (dpkg-query -W -f='${Version}' ca-certificates || apk info -v ca-certificates || rpm -q ca-certificates) 2>/dev/null | head -1); echo $T
 '@
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 }
@@ -354,7 +374,8 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
   if (-not (Kv $out 'sys')) { Warn "python $v ($py): too old to test or probe failed"; continue }
   if (-not $script:PyB) { $script:PyB = $py }
   $pipfix = "& '$py' -m pip install -U pip certifi"
-  Res "python $v ($py) default trust (Windows Root store, ignores Disallowed)" (Kv $out 'sys') 'pip install -U certifi truststore and use truststore (honors Disallowed); or set SSL_CERT_FILE to a patched certifi bundle'
+  $trust = if (Kv $out 'ts') { 'truststore: Windows trust incl. Disallowed' } else { 'Windows Root store, ignores Disallowed' }
+  Res "python $v ($py) default trust ($trust)" (Kv $out 'sys') 'pip install -U certifi truststore and use truststore (honors Disallowed); or set SSL_CERT_FILE to a patched certifi bundle'
   $c = Kv $out 'certifi'
   if ($c) {
     $cv, $cp, $cc = $c -split '\|'
