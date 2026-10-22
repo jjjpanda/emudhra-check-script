@@ -5,11 +5,12 @@
 
 .DESCRIPTION
   Usage:   powershell -ExecutionPolicy Bypass -File .\check-windows.ps1 [-Fix]
-  Method:  1) compare installed versions against the patched-version table
-           2) live TLS test: each client connects to the 12 advisory test hosts
+  Method:  1) live TLS test: each client connects to the 12 advisory test hosts
               (6 compromised TLS intermediates x 2 roots: emSign Root TLS G3 and the
               Sectigo "AAA Certificate Services" cross-sign) plus a control host.
               A patched client must REJECT all 12.
+           2) compare versions against the patched-version table: always for Java, Go, Electron
+              and tools; for certifi, pip and node only if the live test is not verified
            Browsers are not driven; the SUMMARY gives a manual test.
   Codes:   13 letters per client = 12 test hosts (order of $TestHosts), then control (example.com)
            S = TLS accepted   C = rejected as untrusted/revoked   N = network/other error
@@ -19,6 +20,7 @@
   Output:  [OK] / [INFO] / [WARN] / [FAIL] lines, then a SUMMARY: issues, fix commands, manual steps.
   -Fix:    after the checks, run the fix commands (only package-manager / self-update
            commands that are known to be correct for how each item was installed).
+           conda: 'conda update' can re-solve the env and change other packages in it.
   Exit:    0 = no issues, 1 = issues found, 2 = no issues but some checks not verified;
            with -Fix: 3 = a fix command failed; else the codes above, from the scan before the fixes (re-run to verify)
 #>
@@ -36,7 +38,7 @@ $Steps = New-Object System.Collections.Generic.List[string]
 $ToolFix = @{}
 $SeenBundles = @{}
 $WinFix = "install Windows updates; else run Block-EmudhraCompromisedCA.ps1 elevated (see $Ref)"
-$GitFix = 'update Git for Windows when a release with a patched ca-bundle.crt ships (git update-git-for-windows)'
+$GitFix = "update Git for Windows (git update-git-for-windows); if its bundles still trust the test hosts, from an elevated prompt: copy the emSign and AAA root PEMs (see $Ref) to <Git>\etc\pki\ca-trust\source\blocklist\, run '<Git>\usr\bin\sh.exe -c /usr/bin/update-ca-trust', then copy <Git>\etc\pki\ca-trust\extracted\pem\tls-ca-bundle.pem over <Git>\mingw64\etc\ssl\certs\ca-bundle.crt and <Git>\ucrt64\etc\ssl\certs\ca-bundle.crt"
 
 # SHA-256 of the 16 compromised intermediates + Sectigo cross-signs (impacted-intermediates.json)
 $Intermediates = @(
@@ -130,6 +132,17 @@ function Need($label, $v, $depth, $fx, [string[]]$patched) {
   if ($all) { Ok "$label $v" } else { Fail "$label $v" "$fx (>= $want)" }
 }
 
+# VChk: fallback version check when a live test is not verified
+function VChk($label, $v, $min, $step, $cmd) {
+  if (-not $v) { return }
+  if (VGe $v $min) { Ok "$label $v" } else { Fail "$label $v (need >= $min)" $step $cmd }
+}
+
+# Writable: true if the current user can create files in $dir
+function Writable($dir) {
+  try { $f = Join-Path $dir ".w$([guid]::NewGuid())"; [IO.File]::Create($f).Dispose(); Remove-Item -LiteralPath $f; $true } catch { $false }
+}
+
 # UpCmd: upgrade command for the copy of a tool at $path, by how it was installed (empty = unsure)
 function UpCmd($path, $self) {
   $name = [IO.Path]::GetFileNameWithoutExtension($path)
@@ -138,18 +151,18 @@ function UpCmd($path, $self) {
   switch -Regex ($path) {
     '\\scoop\\' {
       $m = [regex]::Match("$path`n$(Get-Content -Raw -LiteralPath ([IO.Path]::ChangeExtension($path, 'shim')))", '\\scoop\\apps\\([^\\]+)\\')
-      return $(if ($m.Success) { "scoop update $($m.Groups[1].Value)" } else { '' })
+      return $(if ($m.Success) { "scoop update $(Q $m.Groups[1].Value)" } else { '' })
     }
     '\\chocolatey\\' { return '' }
     '\\WinGet\\|\\WindowsApps\\' { return '' }
-    '\\mise\\installs\\([^\\]+)\\' { return "mise upgrade $($Matches[1])" }
-    '\\\.pixi\\bin\\' { if ($name -ne 'pixi') { return "pixi global update $name" } }
+    '\\mise\\installs\\([^\\]+)\\' { return "mise upgrade $(Q $Matches[1])" }
+    '\\\.pixi\\bin\\' { if ($name -ne 'pixi') { return "pixi global update $(Q $name)" } }
     '\\\.cargo\\bin\\' { if ($name -ne 'rustup') { return '' } }
   }
   if ($path -match '\.(cmd|ps1)$') {
     $m = [regex]::Match((Get-Content -Raw -LiteralPath $path), 'node_modules\\((@[^\\]+\\)?[^\\"]+)')
     if (-not $m.Success) { return '' }
-    $pkg = $m.Groups[1].Value -replace '\\', '/'
+    $pkg = Q ($m.Groups[1].Value -replace '\\', '/')
     $dir = Split-Path $path
     if ($path -match '\\pnpm\\') { return "pnpm add -g $pkg" }
     if ($path -match '\\\.bun\\') { return "bun add -g $pkg" }
@@ -174,11 +187,12 @@ function Tool($name, $min, $self) {
 # PyFix: command that upgrades $pkgs in the env of $py (pipx / uv tool / conda / uv / pip, user or env install)
 function PyFix($py, $prefix, $em, $inst, $user, [string[]]$pkgs) {
   $p = $pkgs -join ' '
-  if ($prefix -match '\\pipx\\(pipx\\)?venvs\\([^\\]+)') { return "`$h = `$env:PIPX_HOME; `$env:PIPX_HOME = $(Q ($prefix -replace '\\venvs\\[^\\]+$')); pipx runpip $($Matches[2]) install -U $p; `$env:PIPX_HOME = `$h" }
-  if ($prefix -match '\\uv\\tools\\([^\\]+)') { return "uv tool upgrade $($Matches[1])" }
-  if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { return "pixi global update $(Split-Path $prefix -Leaf)" }
-  if ($em -eq '1') { return '' }
+  if ($prefix -match '\\pipx\\(pipx\\)?venvs\\([^\\]+)') { return "`$h = `$env:PIPX_HOME; `$env:PIPX_HOME = $(Q ($prefix -replace '\\venvs\\[^\\]+$')); pipx runpip $(Q $Matches[2]) install -U $p; `$env:PIPX_HOME = `$h" }
+  if ($prefix -match '\\uv\\tools\\([^\\]+)') { return "uv tool upgrade $(Q $Matches[1])" }
+  if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { return "pixi global update $(Q (Split-Path $prefix -Leaf))" }
+  if ($em -eq '1' -or $prefix -match '\\pypoetry\\|\\\.virtualenvs\\|\\hatch\\') { return '' }
   if ($user -eq '1') { return "& $(Q $py) -m pip install --user -U $p" }
+  if (-not (Writable "$prefix\Lib\site-packages")) { return '' }
   switch ($inst) {
     'conda' { if ($Conda) { "$Conda update -y -p $(Q $prefix) $p" } }
     'uv' { "uv pip install -p $(Q $py) -U $p" }
@@ -191,9 +205,10 @@ function Res($label, $codes, $step, $cmd) {
   $c = "$codes".Trim()
   $tests = if ($c.Length -gt 1) { $c.Substring(0, $c.Length - 1) } else { '' }
   $n = @($tests.ToCharArray() | Where-Object { $_ -eq 'S' }).Count
+  $script:NV = $false
   if ($n -gt 0) { Fail "${label}: TRUSTS $n/$NT compromised chains [$c]" $step $cmd }
   elseif ($c -ceq ('C' * $NT + 'S')) { Ok "${label}: rejects all $NT compromised chains" }
-  else { Warn "${label}: not verified [$(if ($c) { $c } else { 'no output' })]" }
+  else { Warn "${label}: not verified [$(if ($c) { $c } else { 'no output' })]"; $script:NV = $true }
 }
 
 # Cands: unique executables from PATH names and explicit paths/globs
@@ -242,23 +257,28 @@ function OpensslCodes($exe) {
 # The TLS callback records the policy errors and chain status Windows computed, then lets the handshake finish.
 function NetCodes {
   -join ($Urls | ForEach-Object {
-    $h = ([uri]$_).Host; $script:chainResult = ''; $tcp = $null
-    try {
-      $tcp = New-Object Net.Sockets.TcpClient
-      if ($tcp.ConnectAsync($h, 443).Wait(15000)) {
-        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [Net.Security.RemoteCertificateValidationCallback] {
-          param($sender, $cert, $chain, $errors)
-          $script:chainResult = "$errors " + (@($chain.ChainStatus | ForEach-Object Status) -join ' ')
-          $true
-        })
-        $ssl.ReadTimeout = 15000
-        $ssl.AuthenticateAsClient($h)
-        $ssl.Dispose()
-      }
-    } catch {} finally { if ($tcp) { $tcp.Dispose() } }
-    if ($script:chainResult -match '^None\s*$') { 'S' }
-    elseif ($script:chainResult -match 'UntrustedRoot|Revoked|PartialChain|NotTrusted|ExplicitDistrust') { 'C' }
-    else { 'N' }
+    $h = ([uri]$_).Host
+    foreach ($try in 1, 2) {
+      $script:chainResult = ''; $tcp = $null
+      try {
+        $tcp = New-Object Net.Sockets.TcpClient
+        if ($tcp.ConnectAsync($h, 443).Wait(15000)) {
+          $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [Net.Security.RemoteCertificateValidationCallback] {
+            param($sender, $cert, $chain, $errors)
+            $script:chainResult = "$errors " + (@($chain.ChainStatus | ForEach-Object Status) -join ' ')
+            $true
+          })
+          $ssl.ReadTimeout = 15000
+          $ssl.AuthenticateAsClient($h)
+          $ssl.Dispose()
+        }
+      } catch {} finally { if ($tcp) { $tcp.Dispose() } }
+      $r = if ($script:chainResult -match '^None\s*$') { 'S' }
+           elseif ($script:chainResult -match 'UntrustedRoot|Revoked|PartialChain|NotTrusted|ExplicitDistrust') { 'C' }
+           else { 'N' }
+      if ($r -ne 'N') { break }
+    }
+    $r
   })
 }
 
@@ -296,6 +316,7 @@ REJECT = (2, 19, 20, 21, 23, 28, 0x80092010, 0x800B0109, 0x800B010A, 0x800B010C,
 TRUSTSTORE = ssl.SSLContext.__module__.startswith("truststore")
 def rejected(r):
     return r.verify_code in REJECT or TRUSTSTORE and any(s in str(r.verify_message or r).lower() for s in ("revoked", "not trusted", "untrusted", "distrust"))
+# CA file tests must use OpenSSL with only that file, not the OS verifier truststore injects
 def plain():
     global TRUSTSTORE
     if TRUSTSTORE:
@@ -330,6 +351,10 @@ for key, mod in (("certifi", "certifi"), ("pipcertifi", "pip._vendor.certifi")):
         print("%s=%s|%s|%s" % (key, getattr(m, "__version__", "?"), m.where(), codes(args, m.where())))
     except Exception:
         pass
+try:
+    import pip; print("pip=" + pip.__version__)
+except Exception:
+    pass
 print("em=%d" % (not venv and os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))))
 try:
     from importlib.metadata import distribution
@@ -425,7 +450,8 @@ foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
   Info "$((Run $g @('--version') 15).Out.Trim()) ($g) sslBackend=$(if ($backend) { $backend } else { 'default' })"
   $scope = (Run $g @('config', '--show-scope', '--get', 'http.sslBackend') 15).Out
   $fx = if ($backend -eq 'schannel') { $WinFix } elseif ($scope -match '^(local|worktree|command)') { "$GitFix; or set http.sslBackend=schannel where 'git config --show-origin --get http.sslBackend' points" } else { $GitFix }
-  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)') { "& $(Q $g) config --global http.sslBackend schannel" }
+  $ca = (Run $g @('config', '--get', 'http.sslCAInfo') 15).Out.Trim()
+  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and (-not $ca -or $ca -match '[\\/]Git[\\/]')) { "& $(Q $g) config --global http.sslBackend schannel" }
   Res "git ls-remote ($g)" (GitCodes $g) $fx $cmd
 }
 
@@ -461,11 +487,11 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
   $v = Kv $out 'ver'
   if (-not (Kv $out 'sys')) { Warn "python $v ($py): too old to test or probe failed"; continue }
   if (-not $script:PyB -and $py -notlike '*\Scripts\*') { $script:PyB = $py }
-  $ps = "upgrade pip and certifi in $prefix"
+  $ps = if (Writable "$prefix\Lib\site-packages") { "upgrade pip and certifi in $prefix" } else { "from an elevated prompt: & $(Q $py) -m pip install -U pip certifi" }
   $em = Kv $out 'em'
   $pc = PyFix $py $prefix $em (Kv $out 'inst_certifi') 0 @('pip', 'certifi')
   if (-not (Kv $out 'ts') -and (Test-Path "$prefix\conda-meta")) {
-    $ec = if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { "pixi global update $(Split-Path $prefix -Leaf)" } else { if ($Conda) { "$Conda update -y -p $(Q $prefix) ca-certificates certifi openssl" } }
+    $ec = if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { "pixi global update $(Q (Split-Path $prefix -Leaf))" } else { if ($Conda) { "$Conda update -y -p $(Q $prefix) ca-certificates certifi openssl" } }
     Res "python $v ($py) default trust" (Kv $out 'sys') "update ca-certificates, certifi and openssl in $prefix" $ec
   } else {
     if (Kv $out 'ts') { Res "python $v ($py) default trust (truststore: Windows trust)" (Kv $out 'sys') $WinFix }
@@ -477,13 +503,17 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
     $us, $uc = $ps, $pc
     if ($cp -notlike "$prefix\*" -and $cp -like "$env:APPDATA\*") { $us = "upgrade the user-site certifi ($cp)"; $uc = $(if ($em -ne '1') { "& $(Q $py) -m pip install --user -U certifi" }) }
     Res "certifi $cv bundle ($cp)" $cc $us $uc
+    if ($NV) { VChk "certifi ($cp)" $cv '2026.10.19' $us $uc }
     $SeenBundles[$cp.ToLower()] = 1
   }
   $c = Kv $out 'pipcertifi'
-  if ($c) { $cv, $cp, $cc = $c -split '\|'; Res "pip vendored certifi $cv ($py)" $cc $ps $pc }
+  if ($c) {
+    $cv, $cp, $cc = $c -split '\|'; Res "pip vendored certifi $cv ($py)" $cc $ps $pc
+    if ($NV) { VChk "pip ($py)" (Kv $out 'pip') '26.2.2' $ps $pc }
+  }
   foreach ($tl in @($out | Where-Object { $_ -like 'tool=*' })) {
     $tp, $ti, $tu = ($tl -replace '^tool=', '') -split '\|'
-    if (-not $ToolFix.ContainsKey($tp.ToLower())) { $ToolFix[$tp.ToLower()] = PyFix $py $prefix $em $ti $tu @([IO.Path]::GetFileNameWithoutExtension($tp)) }
+    if (-not $ToolFix.ContainsKey($tp)) { $ToolFix[$tp] = PyFix $py $prefix $em $ti $tu @([IO.Path]::GetFileNameWithoutExtension($tp)) }
   }
 }
 
@@ -500,6 +530,7 @@ foreach ($n in (Cands @('node.exe') $nodeGlobs)) {
   $v = (Run $n @('-v') 15).Out.Trim()
   if (-not $v) { continue }
   Res "node $v ($n)" (Run $n (@("$T\probe.js") + $Urls) 120).Out 'upgrade Node.js to a patched release (>= 22.23.4 | 24.22.1 | 26.12.1)'
+  if ($NV) { Need "node ($n)" $v 1 'upgrade Node.js' @('22.23.4', '24.22.1', '26.12.1') }
   $npm = Join-Path (Split-Path $n) 'npm.cmd'
   if (Test-Path $npm) { Info "npm $(& $npm -v 2>$null) ($npm)" }
 }
@@ -549,7 +580,7 @@ foreach ($rc in "$env:USERPROFILE\.curlrc", "$env:APPDATA\_curlrc") {
 }
 if (Get-Command git) {
   if ((& git config --bool --get http.sslVerify) -eq 'false') {
-    if ("$(& git config --show-scope --get http.sslVerify)" -like 'global*') { Fail 'git http.sslVerify=false (global)' '' 'git config --global --unset-all http.sslVerify' }
+    if ("$(& git config --show-scope --show-origin --get http.sslVerify)" -match '^global\tfile:([^"].*)\t') { Fail 'git http.sslVerify=false (global)' '' "git config --file $(Q $Matches[1]) --unset-all http.sslVerify" }
     else { Fail 'git http.sslVerify=false' "remove it where 'git config --show-origin --get http.sslVerify' points" }
   }
   $c = & git config --get http.sslCAInfo

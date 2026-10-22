@@ -3,11 +3,12 @@
 # Ref: https://emudhra.we-have-a-problem.com/
 #
 # Usage:   bash check-unix.sh [--no-docker] [--fix]
-# Method:  1) compare installed versions against the patched-version table
-#          2) live TLS test: each client connects to the 12 advisory test hosts
+# Method:  1) live TLS test: each client connects to the 12 advisory test hosts
 #             (6 compromised TLS intermediates x 2 roots: emSign Root TLS G3 and the
 #             Sectigo "AAA Certificate Services" cross-sign) plus a control host.
 #             A patched client must REJECT all 12.
+#          2) compare versions against the patched-version table: always for Java, Go, Electron
+#             and tools; for certifi, pip, node and distro ca-certificates only if the live test is not verified
 #          Browsers are not driven; the SUMMARY gives a manual test.
 #          macOS: Safari has no headless mode; the system trust test covers its trust store.
 # Codes:   13 letters per client = 12 test hosts (order of TEST_HOSTS), then control (example.com)
@@ -16,7 +17,9 @@
 # Output:  [OK] / [INFO] / [WARN] / [FAIL] lines, then a SUMMARY: issues, fix commands, manual steps.
 # --fix:   after the checks, run the fix commands (only package-manager / self-update
 #          commands that are known to be correct for how each item was installed).
-# Exit:    0 = no issues, 1 = issues found, 2 = no issues but some checks not verified;
+#          Arch: the ca-certificates fix is a full system upgrade (pacman -Syu).
+#          conda: 'conda update' can re-solve the env and change other packages in it.
+# Exit:   0 = no issues, 1 = issues found, 2 = no issues but some checks not verified;
 #          with --fix: 3 = a fix command failed; else the codes above, from the scan before the fixes (re-run to verify)
 # Note:    macOS: /usr/bin/python3, pip3 and git are skipped if Xcode Command Line Tools are
 #          missing (running them would open an install dialog). Runs on the system bash 3.2.
@@ -138,6 +141,12 @@ need() {
   [ $all = 1 ] && ok "$label $v" || fail "$label $v" "$fix (>= $want)"
 }
 
+# vchk LABEL VERSION MIN STEP [CMD]: fallback version check when a live test is not verified
+vchk() {
+  [ -n "$2" ] || return 0
+  vge "$2" "$3" && ok "$1 $2" || fail "$1 $2 (need >= $3)" "$4" "${5:-}"
+}
+
 # owner PATH: distro package that owns PATH (empty if none)
 owner() {
   { dpkg -S "$1" 2>/dev/null | sed -n '1s/: .*//p'; rpm -qf --qf '%{NAME}\n' "$1" 2>/dev/null | grep -v ' '; pacman -Qqo "$1" 2>/dev/null; } | head -1
@@ -154,7 +163,7 @@ brewof() {
 jsfix() {
   local pkg pre
   pkg=${1#*/node_modules/}; case $pkg in .pnpm/*) pkg=${pkg##*/node_modules/} ;; esac
-  pkg=$(printf '%s' "$pkg" | sed -E 's#^((@[^/]+/)?[^/]+).*#\1#')
+  pkg=$(q "$(printf '%s' "$pkg" | sed -E 's#^((@[^/]+/)?[^/]+).*#\1#')")
   case $1 in
     */pnpm/*)                echo "pnpm add -g $pkg" ;;
     */.bun/install/global/*) echo "bun add -g $pkg" ;;
@@ -171,13 +180,13 @@ upcmd() {
   n=$(basename "$p"); r=$(rp "$p")
   for e in "${TOOLFIX[@]}"; do [ "${e%%|*}" = "$r" ] && { printf '%s\n' "${e#*|}"; return; }; done
   case $p in
-    /snap/*) echo "$SUDO snap refresh $n"; return ;;
-    */.pixi/bin/*) [ "$n" = pixi ] || { echo "pixi global update $n"; return; } ;;
+    /snap/*) echo "$SUDO snap refresh $(q "$n")"; return ;;
+    */.pixi/bin/*) [ "$n" = pixi ] || { echo "pixi global update $(q "$n")"; return; } ;;
   esac
   case $r in
-    */Cellar/*|*/Caskroom/*) echo "$(brewof "$r") upgrade $(printf '%s' "$r" | sed -E 's#.*/(Cellar|Caskroom)/([^/]+)/.*#\2#')" ;;
+    */Cellar/*|*/Caskroom/*) echo "$(brewof "$r") upgrade $(q "$(printf '%s' "$r" | sed -E 's#.*/(Cellar|Caskroom)/([^/]+)/.*#\2#')")" ;;
     */node_modules/*)        jsfix "$r" ;;
-    */mise/installs/*)       echo "mise upgrade $(printf '%s' "$r" | sed -E 's#.*/mise/installs/([^/]+)/.*#\1#')" ;;
+    */mise/installs/*)       echo "mise upgrade $(q "$(printf '%s' "$r" | sed -E 's#.*/mise/installs/([^/]+)/.*#\1#')")" ;;
     /nix/*) ;;
     /usr/bin/*|/usr/lib/*|/usr/libexec/*|/usr/share/*|/bin/*) o=$(owner "$p"); [ -z "$o" ] && o=$(owner "$r")
                              [ -n "${PKGUP:-}" ] && [ -n "$o" ] && echo "$PKGUP $o" ;;
@@ -201,11 +210,11 @@ tool() {
 # pyfix PY PREFIX EM INSTALLER USER PKG...: command that upgrades PKGs in the env of PY (empty = OS-managed, fix by hand)
 pyfix() {
   local py=$1 prefix=$2 em=$3 inst=$4 user=$5; shift 5
+  [ -f "$prefix/pipx_metadata.json" ] && { echo "PIPX_HOME=$(q "${prefix%/venvs/*}") pipx runpip $(q "$(basename "$prefix")") install -U $*"; return; }
   case $prefix in
-    */pipx/venvs/*)       echo "PIPX_HOME=$(q "${prefix%/venvs/*}") pipx runpip $(basename "$prefix") install -U $*"; return ;;
-    */uv/tools/*)         echo "uv tool upgrade $(basename "$prefix")"; return ;;
-    "$HOME"/.pixi/envs/*) echo "pixi global update $(basename "$prefix")"; return ;;
-    /usr|/System/*|/Library/Developer/*) return ;;
+    */uv/tools/*)         echo "uv tool upgrade $(q "$(basename "$prefix")")"; return ;;
+    "$HOME"/.pixi/envs/*) echo "pixi global update $(q "$(basename "$prefix")")"; return ;;
+    /usr|/System/*|/Library/Developer/*|*/pypoetry/virtualenvs/*|"$HOME"/.virtualenvs/*|*/hatch/env/virtual/*) return ;;
   esac
   [ "$em" = 1 ] && return
   [ "$user" = 1 ] && { echo "$(q "$py") -m pip install --user -U $*"; return; }
@@ -222,7 +231,7 @@ res() {
   n=$(printf '%s' "$tests" | tr -cd S | wc -c | tr -d ' ')
   if [ "$n" -gt 0 ]; then fail "$1: TRUSTS $n/$NT compromised chains [$2]" "$3" "${4:-}"
   elif [ "$tests" = "$ALL_C" ] && [ "$ctrl" = S ]; then ok "$1: rejects all $NT compromised chains"
-  else warn "$1: not verified [${2:-no output}]"
+  else warn "$1: not verified [${2:-no output}]"; return 1
   fi
 }
 
@@ -315,16 +324,16 @@ nsurl_codes() {
 # bundle LABEL FILE STEP [CMD]: live-test one PEM CA bundle file (once per real path)
 bundle() {
   local r
-  [ -s "$2" ] || return
+  [ -s "$2" ] || return 0
   r=$(rp "$2")
-  case $SEEN_BUNDLES in *"|$r|"*) return ;; esac
+  case $SEEN_BUNDLES in *"|$r|"*) return 0 ;; esac
   SEEN_BUNDLES="$SEEN_BUNDLES$r|"
   if [ -n "$PYB" ]; then
     res "$1 ($2)" "$(to 300 "$PYB" "$T/probe.py" --cafile "$2" $URLS 2>/dev/null </dev/null)" "$3" "${4:-}"
   elif [ -n "$CURL1" ]; then
     res "$1 ($2)" "$(curl_codes "$CURL1" --cacert "$2")" "$3" "${4:-}"
   else
-    warn "$1 ($2): no python3/curl to test bundle"
+    warn "$1 ($2): no python3/curl to test bundle"; return 1
   fi
 }
 
@@ -357,10 +366,30 @@ if [ $OS = linux ]; then
     [ "$ID" = nixos ] && CAFIX="add both roots to security.pki.caCertificateBlacklist per $REF"
   }
   os_bundles() {
+    local f nv=
     hdr "System CA bundles"
     for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
-      bundle "system bundle" "$f" "$CAFIX" "$CACMD"
+      bundle "system bundle" "$f" "$CAFIX" "$CACMD" || nv=1
     done
+    [ -n "$nv" ] && ca_pkg
+  }
+  ca_pkg() {
+    local cv min
+    case $ID in
+      ubuntu|debian|devuan)
+        cv=$(dpkg-query -W -f='${Version}' ca-certificates 2>/dev/null); [ -n "$cv" ] || return 0
+        case "$ID:${VERSION_ID:-}" in
+          ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|ubuntu:26.10) min="20260816ubuntu0.$VERSION_ID.1" ;;
+          ubuntu:*)                     min=20260816 ;;
+          debian:12*|devuan:5*)         min='20250419~deb12u2' ;;
+          debian:13*|devuan:6*)         min='20250419+deb13u1' ;;
+          *)                            min='20260816+nmu1' ;;
+        esac
+        dpkg --compare-versions "$cv" ge "$min" && ok "ca-certificates $cv" || fail "ca-certificates $cv (need >= $min)" "$CAFIX" "$CACMD" ;;
+      alpine) cv=$(apk info -v ca-certificates 2>/dev/null | head -1); vchk ca-certificates "${cv#ca-certificates-}" 20261020-r0 "$CAFIX" "$CACMD" ;;
+      fedora) vchk ca-certificates "$(rpm -q --qf '%{VERSION}' ca-certificates 2>/dev/null)" 2026.2.92_v9.0.319 "$CAFIX" "$CACMD" ;;
+      arch)   vchk ca-certificates-mozilla "$(pacman -Q ca-certificates-mozilla 2>/dev/null | awk '{print $2}')" 3.131.1-1 "$CAFIX" "$CACMD" ;;
+    esac
   }
   browsers() {
     for b in google-chrome chromium chromium-browser microsoft-edge brave-browser vivaldi opera firefox firefox-esr; do
@@ -378,6 +407,8 @@ if [ $OS = linux ]; then
   bfix() {
     local o
     BS=$ps; BC=$pc
+    [ -f "$prefix/pipx_metadata.json" ] && case $1 in "${prefix%/venvs/*}"/shared/*)
+      BS="upgrade pipx shared pip ($1)"; BC="PIPX_HOME=$(q "${prefix%/venvs/*}") pipx upgrade-shared"; return ;; esac
     case $1 in
       /etc/*)      BS=$CAFIX; BC=$CACMD; return ;;
       "$prefix"/*) [ "$prefix" = /usr ] || return ;;
@@ -406,8 +437,8 @@ if [ $OS = linux ]; then
     ~/miniconda3/bin/python ~/anaconda3/bin/python ~/miniforge3/bin/python ~/mambaforge/bin/python ~/micromamba/bin/python /opt/conda/bin/python
     ~/miniconda3/envs/*/bin/python ~/anaconda3/envs/*/bin/python ~/miniforge3/envs/*/bin/python ~/mambaforge/envs/*/bin/python
     ~/micromamba/envs/*/bin/python ~/.conda/envs/*/bin/python /opt/conda/envs/*/bin/python ~/.pixi/envs/*/bin/python
-    ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python ~/.local/share/uv/tools/*/bin/python
-    ~/.virtualenvs/*/bin/python ~/.cache/pypoetry/virtualenvs/*/bin/python ~/.local/share/hatch/env/virtual/*/*/bin/python
+    ${PIPX_HOME:+"$PIPX_HOME"/venvs/*/bin/python} ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python
+    ~/.local/share/uv/tools/*/bin/python ~/.virtualenvs/*/bin/python ~/.cache/pypoetry/virtualenvs/*/bin/python ~/.local/share/hatch/env/virtual/*/*/bin/python
     /home/linuxbrew/.linuxbrew/bin/python3{,.[0-9]*})
   NODE_CANDS=(node nodejs ~/.nvm/versions/node/*/bin/node ~/.volta/tools/image/node/*/bin/node
     ~/.local/share/fnm/node-versions/*/installation/bin/node /usr/local/n/versions/node/*/bin/node
@@ -485,8 +516,8 @@ else
     /opt/miniconda3/bin/python /opt/anaconda3/bin/python /opt/homebrew/Caskroom/miniforge/base/bin/python
     ~/miniconda3/envs/*/bin/python ~/anaconda3/envs/*/bin/python ~/miniforge3/envs/*/bin/python /opt/miniconda3/envs/*/bin/python
     ~/mambaforge/envs/*/bin/python ~/micromamba/envs/*/bin/python ~/.conda/envs/*/bin/python ~/.pixi/envs/*/bin/python
-    ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python ~/.local/share/uv/tools/*/bin/python
-    ~/.virtualenvs/*/bin/python ~/Library/Caches/pypoetry/virtualenvs/*/bin/python
+    ${PIPX_HOME:+"$PIPX_HOME"/venvs/*/bin/python} ~/.local/share/pipx/venvs/*/bin/python ~/.local/pipx/venvs/*/bin/python
+    "$HOME/Library/Application Support/pipx/venvs"/*/bin/python ~/.local/share/uv/tools/*/bin/python ~/.virtualenvs/*/bin/python ~/Library/Caches/pypoetry/virtualenvs/*/bin/python
     "$HOME/Library/Application Support/hatch/env/virtual"/*/*/bin/python)
   NODE_CANDS=(node ~/.nvm/versions/node/*/bin/node ~/.volta/tools/image/node/*/bin/node
     ~/.local/share/fnm/node-versions/*/installation/bin/node "$HOME/Library/Application Support/fnm/node-versions"/*/installation/bin/node
@@ -511,6 +542,7 @@ REJECT = (2, 19, 20, 21, 23, 28, 0x80092010, 0x800B0109, 0x800B010A, 0x800B010C,
 TRUSTSTORE = ssl.SSLContext.__module__.startswith("truststore")
 def rejected(r):
     return r.verify_code in REJECT or TRUSTSTORE and any(s in str(r.verify_message or r).lower() for s in ("revoked", "not trusted", "untrusted", "distrust"))
+# CA file tests must use OpenSSL with only that file, not the OS verifier truststore injects
 def plain():
     global TRUSTSTORE
     if TRUSTSTORE:
@@ -545,6 +577,10 @@ for key, mod in (("certifi", "certifi"), ("pipcertifi", "pip._vendor.certifi")):
         print("%s=%s|%s|%s" % (key, getattr(m, "__version__", "?"), m.where(), codes(args, m.where())))
     except Exception:
         pass
+try:
+    import pip; print("pip=" + pip.__version__)
+except Exception:
+    pass
 print("em=%d" % (not venv and os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))))
 try:
     from importlib.metadata import distribution
@@ -630,11 +666,11 @@ while IFS= read -r py <&3; do
   [ -z "$(kv sys "$out")" ] && { warn "python ${v:-?} ($py): too old to test or probe failed"; continue; }
   py_steps
   case $prefix in
-    "$HOME"/.pixi/envs/*) ec="pixi global update $(basename "$prefix")" ;;
+    "$HOME"/.pixi/envs/*) ec="pixi global update $(q "$(basename "$prefix")")" ;;
     *)                    ec=${CONDA:+$CONDA update -y -p $(q "$prefix") ca-certificates certifi openssl} ;;
   esac
   if [ -z "$ts" ] && [ -d "$prefix/conda-meta" ]; then
-    res "python $v ($py) default trust${ts:+ (truststore)}" "$(kv sys "$out")" "update ca-certificates, certifi and openssl in $prefix" "$ec"
+    res "python $v ($py) default trust" "$(kv sys "$out")" "update ca-certificates, certifi and openssl in $prefix" "$ec"
   else
     py_trust
     res "python $v ($py) default trust${ts:+ (truststore)}" "$(kv sys "$out")" "$FS" "$FC"
@@ -642,11 +678,11 @@ while IFS= read -r py <&3; do
   c=$(kv certifi "$out")
   if [ -n "$c" ]; then
     rest=${c#*|}; cp=${rest%|*}
-    bfix "$cp" certifi; res "certifi ${c%%|*} bundle ($cp)" "${rest##*|}" "$BS" "$BC"
+    bfix "$cp" certifi; res "certifi ${c%%|*} bundle ($cp)" "${rest##*|}" "$BS" "$BC" || vchk "certifi ($cp)" "${c%%|*}" 2026.10.19 "$BS" "$BC"
     SEEN_BUNDLES="$SEEN_BUNDLES$(rp "$cp")|"
   fi
   c=$(kv pipcertifi "$out")
-  [ -n "$c" ] && { rest=${c#*|}; bfix "${rest%|*}" pip; res "pip vendored certifi ${c%%|*} ($py)" "${rest##*|}" "$BS" "$BC"; }
+  [ -n "$c" ] && { rest=${c#*|}; bfix "${rest%|*}" pip; res "pip vendored certifi ${c%%|*} ($py)" "${rest##*|}" "$BS" "$BC" || vchk "pip ($py)" "$(kv pip "$out")" 26.2.2 "$BS" "$BC"; }
   while IFS='|' read -r tp ti tu; do
     [ -n "$tp" ] && TOOLFIX+=("$tp|$(pyfix "$py" "$prefix" "$em" "$ti" "$tu" "$(basename "$tp")")")
   done < <(printf '%s\n' "$out" | sed -n 's/^tool=//p')
@@ -655,7 +691,8 @@ done 3< <(cands --keep-links "${PY_NAMES[@]}" "${PY_PATHS[@]}")
 hdr "Node.js / npm"
 while IFS= read -r n <&3; do
   v=$("$n" -v 2>/dev/null </dev/null) || continue
-  res "node $v ($n)" "$(to 120 "$n" "$T/probe.js" $URLS 2>/dev/null </dev/null)" "upgrade Node.js to a patched release (>= 22.23.4 | 24.22.1 | 26.12.1)"
+  res "node $v ($n)" "$(to 120 "$n" "$T/probe.js" $URLS 2>/dev/null </dev/null)" "upgrade Node.js to a patched release (>= 22.23.4 | 24.22.1 | 26.12.1)" ||
+    need "node ($n)" "$v" 1 "upgrade Node.js" 22.23.4 24.22.1 26.12.1
   [ -x "$(dirname "$n")/npm" ] && info "npm $("$(dirname "$n")/npm" -v 2>/dev/null </dev/null) ($(dirname "$n")/npm)"
 done 3< <(cands "${NODE_CANDS[@]}")
 
@@ -697,8 +734,9 @@ grep -Eqs '^[[:space:]]*(-k|--insecure|insecure)' ~/.curlrc && fail "~/.curlrc d
 GIT1=$(cands "${GIT_CANDS[@]}" | head -1)
 if [ -n "$GIT1" ]; then
   if [ "$("$GIT1" config --bool --get http.sslVerify)" = false ]; then
-    case $("$GIT1" config --show-scope --get http.sslVerify 2>/dev/null) in
-      global*) fail "git http.sslVerify=false (global)" "" "git config --global --unset-all http.sslVerify" ;;
+    o=$("$GIT1" config --show-scope --show-origin --get http.sslVerify 2>/dev/null); f=${o#*$'\t'file:}; f=${f%$'\t'*}
+    case $o in
+      global$'\t'file:[!\"]*) fail "git http.sslVerify=false (global)" "" "git config --file $(q "$f") --unset-all http.sslVerify" ;;
       *)       fail "git http.sslVerify=false" "remove it where 'git config --show-origin --get http.sslVerify' points" ;;
     esac
   fi
