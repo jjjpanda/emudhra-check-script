@@ -161,16 +161,16 @@ brewof() {
 
 # jsfix PATH: upgrade command for a global JS package that contains PATH (npm of the same node, pnpm, bun, yarn)
 jsfix() {
-  local pkg pre
+  local pkg pre s
   pkg=${1#*/node_modules/}; case $pkg in .pnpm/*) pkg=${pkg##*/node_modules/} ;; esac
   pkg=$(q "$(printf '%s' "$pkg" | sed -E 's#^((@[^/]+/)?[^/]+).*#\1#')")
   case $1 in
     */pnpm/*)                echo "pnpm add -g $pkg" ;;
     */.bun/install/global/*) echo "bun add -g $pkg" ;;
     */yarn/global/*)         echo "yarn global add $pkg" ;;
-    */lib/node_modules/*) pre=${1%%/lib/node_modules/*}
-       if [ -x "$pre/bin/node" ] && [ -e "$pre/bin/npm" ]; then echo "$(q "$pre/bin/node") $(q "$pre/bin/npm") install -g --prefix $(q "$pre") $pkg"
-       else echo "npm install -g --prefix $(q "$pre") $pkg"; fi ;;
+    */lib/node_modules/*) pre=${1%%/lib/node_modules/*}; s=; [ -w "$pre/lib/node_modules" ] || s=${SUDO:+$SUDO }
+       if [ -x "$pre/bin/node" ] && [ -e "$pre/bin/npm" ]; then echo "$s$(q "$pre/bin/node") $(q "$pre/bin/npm") install -g --prefix $(q "$pre") $pkg"
+       else echo "${s}npm install -g --prefix $(q "$pre") $pkg"; fi ;;
   esac
 }
 
@@ -185,7 +185,7 @@ upcmd() {
   esac
   case $r in
     */Cellar/*|*/Caskroom/*) echo "$(brewof "$r") upgrade $(q "$(printf '%s' "$r" | sed -E 's#.*/(Cellar|Caskroom)/([^/]+)/.*#\2#')")" ;;
-    */node_modules/*)        jsfix "$r" ;;
+    */node_modules/*)        o=$(owner "$r"); if [ -n "$o" ]; then [ -n "${PKGUP:-}" ] && echo "$PKGUP $o"; else jsfix "$r"; fi ;;
     */mise/installs/*)       echo "mise upgrade $(q "$(printf '%s' "$r" | sed -E 's#.*/mise/installs/([^/]+)/.*#\1#')")" ;;
     /nix/*) ;;
     /usr/bin/*|/usr/lib/*|/usr/libexec/*|/usr/share/*|/bin/*) o=$(owner "$p"); [ -z "$o" ] && o=$(owner "$r")
@@ -207,17 +207,18 @@ tool() {
   done 4< <(cands "$name" "${extra[@]}")
 }
 
-# pyfix PY PREFIX EM INSTALLER USER PKG...: command that upgrades PKGs in the env of PY (empty = OS-managed, fix by hand)
+# pyfix PY PREFIX EM INSTALLER USER PKG...: command that upgrades PKGs in the env of PY (empty = OS-managed, project venv or not writable: fix by hand)
 pyfix() {
   local py=$1 prefix=$2 em=$3 inst=$4 user=$5; shift 5
   [ -f "$prefix/pipx_metadata.json" ] && { echo "PIPX_HOME=$(q "${prefix%/venvs/*}") pipx runpip $(q "$(basename "$prefix")") install -U $*"; return; }
   case $prefix in
     */uv/tools/*)         echo "uv tool upgrade $(q "$(basename "$prefix")")"; return ;;
     "$HOME"/.pixi/envs/*) echo "pixi global update $(q "$(basename "$prefix")")"; return ;;
-    /usr|/System/*|/Library/Developer/*|*/pypoetry/virtualenvs/*|"$HOME"/.virtualenvs/*|*/hatch/env/virtual/*) return ;;
+    /usr|/System/*|/Library/Developer/*) return ;;
   esac
-  [ "$em" = 1 ] && return
+  [ "$em" = 1 ] || [ -f "$prefix/pyvenv.cfg" ] && return
   [ "$user" = 1 ] && { echo "$(q "$py") -m pip install --user -U $*"; return; }
+  [ -w "$prefix" ] && [ -w "$(kv lib "$out")" ] || return
   case $inst in
     conda) [ -n "$CONDA" ] && echo "$CONDA update -y -p $(q "$prefix") $*" ;;
     uv)    echo "uv pip install -p $(q "$py") -U $*" ;;
@@ -381,12 +382,20 @@ if [ $OS = linux ]; then
     [ -n "$nv" ] && ca_pkg
   }
   ca_pkg() {
-    local cv min
+    local cv min d=$ID vid=${VERSION_ID:-}
     case $ID in
+      ubuntu|debian|devuan|alpine|fedora|arch) ;;
+      *) case " ${ID_LIKE:-} " in *" ubuntu "*) d=ubuntu ;; *" debian "*) d=debian ;; *" arch "*) d=arch ;; esac ;;
+    esac
+    case $d in
       ubuntu|debian|devuan)
         cv=$(dpkg-query -W -f='${Version}' ca-certificates 2>/dev/null); [ -n "$cv" ] || return 0
-        case "$ID:${VERSION_ID:-}" in
-          ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|ubuntu:26.10) min="20260816ubuntu0.$VERSION_ID.1" ;;
+        if [ "$d" != "$ID" ]; then
+          vid=$(printf '%s\n' "$cv" | sed -nE 's/.*ubuntu0\.([0-9]+\.[0-9]+).*/\1/p; s/.*deb([0-9]+)u.*/\1/p' | head -1)
+          [ -n "$vid" ] || { warn "ca-certificates $cv: $ID base release unknown"; return 0; }
+        fi
+        case "$d:$vid" in
+          ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|ubuntu:26.10) min="20260816ubuntu0.$vid.1" ;;
           ubuntu:*)                     min=20260816 ;;
           debian:12*|devuan:5*)         min='20250419~deb12u2' ;;
           debian:13*|devuan:6*)         min='20250419+deb13u1' ;;
@@ -433,7 +442,7 @@ if [ $OS = linux ]; then
       pc=$(pyfix "$py" "$prefix" "$em" "$(kv inst_certifi "$out")" 0 pip certifi)
     fi
   }
-  py_trust() { FS=$CAFIX; FC=$CACMD; }
+  py_trust() { case $(rp "$py") in */Cellar/*|*/.linuxbrew/*) by "$py" ;; *) FS=$CAFIX; FC=$CACMD ;; esac; }
   CURL_CANDS=(curl /usr/local/bin/curl /home/linuxbrew/.linuxbrew/bin/curl)
   GIT_CANDS=(git)
   OPENSSL_CANDS=(openssl)
@@ -589,6 +598,7 @@ try:
 except Exception:
     pass
 print("em=%d" % (not venv and os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))))
+print("lib=" + sysconfig.get_path("purelib"))
 try:
     from importlib.metadata import distribution
 except ImportError:
@@ -747,7 +757,7 @@ if [ -n "$GIT1" ]; then
       *)       fail "git http.sslVerify=false" "remove it where 'git config --show-origin --get http.sslVerify' points" ;;
     esac
   fi
-  c=$("$GIT1" config --get http.sslCAInfo) && bundle "git http.sslCAInfo" "$c" "point http.sslCAInfo to a patched bundle"
+  c=$("$GIT1" config --path --get http.sslCAInfo) && bundle "git http.sslCAInfo" "$c" "point http.sslCAInfo to a patched bundle"
 fi
 if have npm; then
   if [ "$(to 30 npm config get strict-ssl 2>/dev/null)" = false ]; then

@@ -192,7 +192,7 @@ function PyFix($py, $prefix, $em, $inst, $user, [string[]]$pkgs) {
   if (Test-Path "$prefix\pipx_metadata.json") { return PipxCmd $prefix "runpip $(Q (Split-Path $prefix -Leaf)) install -U $p" }
   if ($prefix -match '\\uv\\tools\\([^\\]+)') { return "uv tool upgrade $(Q $Matches[1])" }
   if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { return "pixi global update $(Q (Split-Path $prefix -Leaf))" }
-  if ($em -eq '1' -or $prefix -match '\\pypoetry\\|\\\.virtualenvs\\|\\hatch\\') { return '' }
+  if ($em -eq '1' -or (Test-Path "$prefix\pyvenv.cfg")) { return '' }
   if ($user -eq '1') { return "& $(Q $py) -m pip install --user -U $p" }
   if (-not (Writable "$prefix\Lib\site-packages")) { return '' }
   switch ($inst) {
@@ -453,10 +453,10 @@ foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
   Info "$((Run $g @('--version') 15).Out.Trim()) ($g) sslBackend=$(if ($backend) { $backend } else { 'default' })"
   $scope = (Run $g @('config', '--show-scope', '--get', 'http.sslBackend') 15).Out
   $fx = if ($backend -eq 'schannel') { $WinFix } elseif ($scope -match '^(local|worktree|command)') { "$GitFix; or set http.sslBackend=schannel where 'git config --show-origin --get http.sslBackend' points" } else { $GitFix }
-  $ca = (Run $g @('config', '--get', 'http.sslCAInfo') 15).Out.Trim()
+  $ca = (Run $g @('config', '--path', '--get', 'http.sslCAInfo') 15).Out.Trim()
   $root = $g -replace '\\(cmd|bin|(mingw64|ucrt64)\\bin)\\git\.exe$'
   $own = $ca -and ($GitBundles | ForEach-Object { "$root\$_" }) -contains [IO.Path]::GetFullPath($ca)
-  $custom = $env:GIT_SSL_CAINFO -or $env:GIT_SSL_CAPATH -or (Run $g @('config', '--get-regexp', '^http\.(.+\.sslcainfo|(.+\.)?sslcapath)$') 15).Out.Trim()
+  $custom = $env:GIT_SSL_CAINFO -or $env:GIT_SSL_CAPATH -or $env:GIT_SSL_CERT -or $env:GIT_SSL_KEY -or (Run $g @('config', '--get-regexp', '^http\.(.+\.sslcainfo|(.+\.)?(sslcapath|sslcert|sslkey))$') 15).Out.Trim()
   $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and -not $custom -and (-not $ca -or $own)) { "& $(Q $g) config --global http.sslBackend schannel" }
   Res "git ls-remote ($g)" (GitCodes $g) $fx $cmd
 }
@@ -592,7 +592,7 @@ if (Get-Command git) {
     if ("$(& git config --show-scope --show-origin --get http.sslVerify)" -match '^global\tfile:([^"].*)\t') { Fail 'git http.sslVerify=false (global)' '' "git config --file $(Q $Matches[1]) --unset-all http.sslVerify" }
     else { Fail 'git http.sslVerify=false' "remove it where 'git config --show-origin --get http.sslVerify' points" }
   }
-  $c = & git config --get http.sslCAInfo
+  $c = & git config --path --get http.sslCAInfo
   if ($c) { Bundle 'git http.sslCAInfo' $c 'point http.sslCAInfo to a patched bundle' }
 }
 if (Get-Command npm) {
@@ -680,7 +680,9 @@ else {
         0 { Ok "WSL $($d.Name): no issues" }
         1 {
           $fixCmd = if ($r.Out -match 'Fix commands') { "wsl -d $(Q $d.Name) -e bash $(Q $p) --fix$(if ($dockerOk) { ' --no-docker' }); if (`$LASTEXITCODE -notin 0, 1, 2) { throw ""WSL fix run failed (exit `$LASTEXITCODE)"" }; `$global:LASTEXITCODE = 0" }
-          Fail "WSL $($d.Name): issues found (see its SUMMARY above)" "apply the manual steps listed for WSL $($d.Name) above" $fixCmd
+          $step = "apply the manual steps listed for WSL $($d.Name) above"
+          Fail "WSL $($d.Name): issues found (see its SUMMARY above)" $step $fixCmd
+          if ($fixCmd -and $r.Out -match 'Manual steps') { Note "WSL $($d.Name): manual steps" $step }
         }
         2 { Warn "WSL $($d.Name): some checks not verified (see its SUMMARY above)" }
         default { Warn "WSL $($d.Name): check-unix.sh did not finish (code $($r.Code))" }
