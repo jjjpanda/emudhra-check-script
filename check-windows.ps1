@@ -184,10 +184,12 @@ function Tool($name, $min, $self) {
   }
 }
 
+function PipxCmd($prefix, $cmd) { "`$h = `$env:PIPX_HOME; `$env:PIPX_HOME = $(Q (Split-Path (Split-Path $prefix))); pipx $cmd; `$env:PIPX_HOME = `$h" }
+
 # PyFix: command that upgrades $pkgs in the env of $py (pipx / uv tool / conda / uv / pip, user or env install)
 function PyFix($py, $prefix, $em, $inst, $user, [string[]]$pkgs) {
   $p = $pkgs -join ' '
-  if ($prefix -match '\\pipx\\(pipx\\)?venvs\\([^\\]+)') { return "`$h = `$env:PIPX_HOME; `$env:PIPX_HOME = $(Q ($prefix -replace '\\venvs\\[^\\]+$')); pipx runpip $(Q $Matches[2]) install -U $p; `$env:PIPX_HOME = `$h" }
+  if (Test-Path "$prefix\pipx_metadata.json") { return PipxCmd $prefix "runpip $(Q (Split-Path $prefix -Leaf)) install -U $p" }
   if ($prefix -match '\\uv\\tools\\([^\\]+)') { return "uv tool upgrade $(Q $Matches[1])" }
   if ($prefix -like "$env:USERPROFILE\.pixi\envs\*") { return "pixi global update $(Q (Split-Path $prefix -Leaf))" }
   if ($em -eq '1' -or $prefix -match '\\pypoetry\\|\\\.virtualenvs\\|\\hatch\\') { return '' }
@@ -433,6 +435,7 @@ $rootHashes = StoreHashes 'Root'
 foreach ($h in $Roots.Keys) { if ($rootHashes -contains $h) { Info "root present in Root store: $($Roots[$h])" } }
 Res '.NET/Schannel (Windows trust)' (NetCodes) $WinFix
 
+$GitBundles = 'ucrt64\etc\ssl\certs\ca-bundle.crt', 'mingw64\etc\ssl\certs\ca-bundle.crt', 'mingw64\ssl\certs\ca-bundle.crt', 'usr\ssl\certs\ca-bundle.crt'
 $GitCurl = Cands @() @("$env:ProgramFiles\Git\ucrt64\bin\curl.exe", "$env:ProgramFiles\Git\mingw64\bin\curl.exe") | Select-Object -First 1
 $PyB = Cands @('python.exe', 'python3.exe') @() | Where-Object { (Run $_ @('-c', 'import ssl; ssl.create_default_context') 30).Code -eq 0 } | Select-Object -First 1
 
@@ -451,7 +454,9 @@ foreach ($g in (Cands @('git.exe') @("$env:ProgramFiles\Git\cmd\git.exe"))) {
   $scope = (Run $g @('config', '--show-scope', '--get', 'http.sslBackend') 15).Out
   $fx = if ($backend -eq 'schannel') { $WinFix } elseif ($scope -match '^(local|worktree|command)') { "$GitFix; or set http.sslBackend=schannel where 'git config --show-origin --get http.sslBackend' points" } else { $GitFix }
   $ca = (Run $g @('config', '--get', 'http.sslCAInfo') 15).Out.Trim()
-  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and (-not $ca -or $ca -match '[\\/]Git[\\/]')) { "& $(Q $g) config --global http.sslBackend schannel" }
+  $root = $g -replace '\\(cmd|bin|(mingw64|ucrt64)\\bin)\\git\.exe$'
+  $own = $ca -and ($GitBundles | ForEach-Object { "$root\$_" }) -contains [IO.Path]::GetFullPath($ca)
+  $cmd = if ($backend -ne 'schannel' -and $scope -notmatch '^(local|worktree|command)' -and (-not $ca -or $own)) { "& $(Q $g) config --global http.sslBackend schannel" }
   Res "git ls-remote ($g)" (GitCodes $g) $fx $cmd
 }
 
@@ -469,7 +474,7 @@ $pyGlobs = @(
   "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe", "$env:ProgramFiles\Python*\python.exe", 'C:\Python*\python.exe',
   "$env:APPDATA\uv\python\*\python.exe", "$env:USERPROFILE\.pyenv\pyenv-win\versions\*\python.exe",
   "$env:LOCALAPPDATA\mise\installs\python\*\python.exe", "$env:USERPROFILE\scoop\apps\python*\current\python.exe",
-  "$env:USERPROFILE\pipx\venvs\*\Scripts\python.exe", "$env:LOCALAPPDATA\pipx\pipx\venvs\*\Scripts\python.exe",
+  "$env:PIPX_HOME\venvs\*\Scripts\python.exe", "$env:USERPROFILE\pipx\venvs\*\Scripts\python.exe", "$env:LOCALAPPDATA\pipx\pipx\venvs\*\Scripts\python.exe",
   "$env:APPDATA\uv\tools\*\Scripts\python.exe", "$env:USERPROFILE\.virtualenvs\*\Scripts\python.exe",
   "$env:LOCALAPPDATA\pypoetry\Cache\virtualenvs\*\Scripts\python.exe", "$env:USERPROFILE\.conda\envs\*\python.exe",
   "$env:USERPROFILE\.pixi\envs\*\python.exe", "$env:USERPROFILE\.rye\py\*\python.exe"
@@ -508,8 +513,11 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
   }
   $c = Kv $out 'pipcertifi'
   if ($c) {
-    $cv, $cp, $cc = $c -split '\|'; Res "pip vendored certifi $cv ($py)" $cc $ps $pc
-    if ($NV) { VChk "pip ($py)" (Kv $out 'pip') '26.2.2' $ps $pc }
+    $cv, $cp, $cc = $c -split '\|'
+    $us, $uc = $ps, $pc
+    if ((Test-Path "$prefix\pipx_metadata.json") -and $cp -like "$(Split-Path (Split-Path $prefix))\shared\*") { $us = "upgrade pipx shared pip ($cp)"; $uc = PipxCmd $prefix 'upgrade-shared' }
+    Res "pip vendored certifi $cv ($py)" $cc $us $uc
+    if ($NV) { VChk "pip ($py)" (Kv $out 'pip') '26.2.2' $us $uc }
   }
   foreach ($tl in @($out | Where-Object { $_ -like 'tool=*' })) {
     $tp, $ti, $tu = ($tl -replace '^tool=', '') -split '\|'
@@ -518,7 +526,7 @@ foreach ($py in (Cands @('python.exe', 'python3.exe') $pyGlobs)) {
 }
 
 Hdr 'Bundles shipped with Git for Windows'
-foreach ($f in "$env:ProgramFiles\Git\ucrt64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\mingw64\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\usr\ssl\certs\ca-bundle.crt") {
+foreach ($f in ($GitBundles | ForEach-Object { "$env:ProgramFiles\Git\$_" })) {
   Bundle 'Git bundle (used when sslBackend=openssl)' $f $GitFix
 }
 

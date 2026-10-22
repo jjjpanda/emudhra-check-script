@@ -339,6 +339,13 @@ bundle() {
 
 PY_NAMES=(python python3 python3.8 python3.9 python3.10 python3.11 python3.12 python3.13 python3.14)
 
+# pipx_shared BUNDLE: set BS / BC to upgrade pipx's shared pip when BUNDLE is in it
+pipx_shared() {
+  [ -f "$prefix/pipx_metadata.json" ] || return 1
+  case $1 in "${prefix%/venvs/*}"/shared/*) ;; *) return 1 ;; esac
+  BS="upgrade pipx shared pip ($1)"; BC="PIPX_HOME=$(q "${prefix%/venvs/*}") pipx upgrade-shared"
+}
+
 # Platform parts: os_store, os_bundles, browsers, by, bfix, py_steps, py_trust and the *_CANDS search lists.
 # by PATH: set FS (manual step) / FC (command) that fix the CA store used by the program at PATH
 # bfix BUNDLE KIND: set BS (manual step) / BC (command) that fix the package that ships BUNDLE
@@ -407,8 +414,7 @@ if [ $OS = linux ]; then
   bfix() {
     local o
     BS=$ps; BC=$pc
-    [ -f "$prefix/pipx_metadata.json" ] && case $1 in "${prefix%/venvs/*}"/shared/*)
-      BS="upgrade pipx shared pip ($1)"; BC="PIPX_HOME=$(q "${prefix%/venvs/*}") pipx upgrade-shared"; return ;; esac
+    pipx_shared "$1" && return
     case $1 in
       /etc/*)      BS=$CAFIX; BC=$CACMD; return ;;
       "$prefix"/*) [ "$prefix" = /usr ] || return ;;
@@ -428,7 +434,7 @@ if [ $OS = linux ]; then
     fi
   }
   py_trust() { FS=$CAFIX; FC=$CACMD; }
-  CURL_CANDS=(curl)
+  CURL_CANDS=(curl /usr/local/bin/curl /home/linuxbrew/.linuxbrew/bin/curl)
   GIT_CANDS=(git)
   OPENSSL_CANDS=(openssl)
   PY_PATHS=(/usr/bin/python3{,.[0-9]*} /usr/local/bin/python3{,.[0-9]*} /opt/python*/bin/python3
@@ -488,6 +494,7 @@ else
   }
   bfix() {
     BS=$ps; BC=$pc
+    pipx_shared "$1" && return
     [ "$2" = pip ] && return
     case $1 in "$prefix"/*) ;; "$HOME"/*) BS="upgrade the user-site certifi ($1)"; BC=$([ "$em" = 1 ] || echo "$(q "$py") -m pip install --user -U certifi") ;; esac
   }
