@@ -143,16 +143,47 @@ function Writable($dir) {
   try { $f = Join-Path $dir ".w$([guid]::NewGuid())"; [IO.File]::Create($f).Dispose(); Remove-Item -LiteralPath $f; $true } catch { $false }
 }
 
+# ScoopCmd: preserve install scope; environment overrides config, then the active Scoop root.
+function ScoopCmd($path) {
+  $target = $path
+  $shim = [IO.Path]::ChangeExtension($path, 'shim')
+  if (Test-Path -LiteralPath $shim -PathType Leaf) {
+    $m = [regex]::Match((Get-Content -Raw -LiteralPath $shim), '(?m)^\s*path\s*=\s*"([^"\r\n]+)"')
+    if (-not $m.Success) { return '' }
+    $target = $m.Groups[1].Value
+  }
+  $activeRoot = "$env:USERPROFILE\scoop"
+  $scoop = Get-Command scoop -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($scoop.Source -match '^(.*)\\(?:shims\\scoop\.(?:ps1|cmd|exe)|apps\\scoop\\[^\\]+\\bin\\scoop\.ps1)$') { $activeRoot = $Matches[1] }
+  $configHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { "$env:USERPROFILE\.config" }
+  $configFile = "$configHome\scoop\config.json"
+  if (Test-Path -LiteralPath "$activeRoot\config.json" -PathType Leaf) { $configFile = "$activeRoot\config.json" }
+  $config = $null
+  if (Test-Path -LiteralPath $configFile -PathType Leaf) {
+    try { $config = Get-Content -Raw -LiteralPath $configFile -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { return '' }
+  }
+  $roots = @(
+    @{ Root = (@($env:SCOOP, $config.root_path, $activeRoot) | Where-Object { $_ } | Select-Object -First 1); Global = $false },
+    @{ Root = (@($env:SCOOP_GLOBAL, $config.global_path, "$env:ProgramData\scoop") | Where-Object { $_ } | Select-Object -First 1); Global = $true }
+  )
+  foreach ($install in $roots) {
+    $root = [IO.Path]::GetFullPath($install.Root).TrimEnd('\')
+    $m = [regex]::Match($target, ('(?i)^' + [regex]::Escape($root) + '\\apps\\([^\\]+)\\'))
+    if ($m.Success) { return "scoop update$(if ($install.Global) { ' --global' }) $(Q $m.Groups[1].Value)" }
+  }
+  ''
+}
+
 # UpCmd: upgrade command for the copy of a tool at $path, by how it was installed (empty = unsure)
 function UpCmd($path, $self) {
   $name = [IO.Path]::GetFileNameWithoutExtension($path)
   $key = (Get-Item -LiteralPath $path).FullName.ToLower()
   if ($ToolFix.ContainsKey($key)) { return $ToolFix[$key] }
+  $scoop = ScoopCmd $path
+  if ($scoop) { return $scoop }
   switch -Regex ($path) {
-    '\\scoop\\' {
-      $m = [regex]::Match("$path`n$(Get-Content -Raw -LiteralPath ([IO.Path]::ChangeExtension($path, 'shim')))", '\\scoop\\apps\\([^\\]+)\\')
-      return $(if ($m.Success) { "scoop update $(Q $m.Groups[1].Value)" } else { '' })
-    }
+    '\\scoop\\' { return '' }
     '\\chocolatey\\' { return '' }
     '\\WinGet\\|\\WindowsApps\\' { return '' }
     '\\mise\\installs\\([^\\]+)\\' { return "mise upgrade $(Q $Matches[1])" }
@@ -170,6 +201,8 @@ function UpCmd($path, $self) {
     if ((Test-Path "$dir\node.exe") -and (Test-Path "$dir\node_modules\npm\bin\npm-cli.js")) { return "& $(Q "$dir\node.exe") $(Q "$dir\node_modules\npm\bin\npm-cli.js") install -g --prefix $(Q $dir) $pkg" }
     return "npm install -g --prefix $(Q $dir) $pkg"
   }
+  # uv tool exports share .local\bin with standalone installs; unknown ownership stays manual.
+  if ($name -eq 'uv') { return '' }
   if ($path -like "$env:USERPROFILE\*" -and $path -match '\\\.(local|deno|pixi|cargo)\\bin\\[^\\]+$') { "& $(Q $path) $self" } else { '' }
 }
 
@@ -184,7 +217,19 @@ function Tool($name, $min, $self) {
   }
 }
 
-function PipxCmd($prefix, $cmd) { "`$h = `$env:PIPX_HOME; `$env:PIPX_HOME = $(Q (Split-Path (Split-Path $prefix))); pipx $cmd; `$env:PIPX_HOME = `$h" }
+function PipxCmd($prefix, $cmd) { "`$previousPipxHome = `$env:PIPX_HOME; try { `$env:PIPX_HOME = $(Q (Split-Path (Split-Path $prefix))); pipx $cmd } finally { `$env:PIPX_HOME = `$previousPipxHome }" }
+
+# InvokeFix: catch PowerShell errors and native nonzero exits; printed errors alone need a re-scan.
+function InvokeFix($command) {
+  $ErrorActionPreference = 'Stop'
+  $global:LASTEXITCODE = 0
+  try {
+    Invoke-Expression $command | Out-Host
+    [pscustomobject]@{ Ok = ($? -and $LASTEXITCODE -eq 0); Code = $LASTEXITCODE; Error = '' }
+  } catch {
+    [pscustomobject]@{ Ok = $false; Code = $LASTEXITCODE; Error = $_.Exception.Message }
+  }
+}
 
 # PyFix: command that upgrades $pkgs in the env of $py (pipx / uv tool / conda / uv / pip, user or env install)
 function PyFix($py, $prefix, $em, $inst, $user, [string[]]$pkgs) {
@@ -721,9 +766,13 @@ if ($Fix -and $Cmds.Count -gt 0) {
   $fixFail = 0
   for ($i = 0; $i -lt $Cmds.Count; $i++) {
     Write-Host "`n+ cmd $($i + 1): $($Cmds[$i])"
-    $global:LASTEXITCODE = 0
-    try { Invoke-Expression $Cmds[$i]; $ok = $? -and $LASTEXITCODE -eq 0 } catch { $ok = $false }
-    if ($ok) { Ok "cmd $($i + 1)" } else { Write-Host "[FAIL] cmd $($i + 1) (exit $LASTEXITCODE)" -ForegroundColor Red; $fixFail = 1 }
+    $result = InvokeFix $Cmds[$i]
+    if ($result.Ok) { Ok "cmd $($i + 1)" }
+    else {
+      $reason = if ($result.Error) { $result.Error } else { "exit $($result.Code)" }
+      Write-Host "[FAIL] cmd $($i + 1): $reason" -ForegroundColor Red
+      $fixFail = 1
+    }
   }
   Write-Host "`nRe-run this script to verify the fixes."
 }
