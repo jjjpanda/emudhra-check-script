@@ -107,7 +107,7 @@ jobs:
           DISTRO_IMAGE: ${{ matrix.image }}
         run: |
           mkdir -p scan-reports
-          docker run --rm --pull=always \
+          if docker run --rm --pull=always \
             -v "$PWD:/work:ro" -v "$PWD/scan-reports:/reports" -w /work \
             "$DISTRO_IMAGE" sh -ec '
               if command -v apt-get >/dev/null; then
@@ -128,7 +128,12 @@ jobs:
               fi
               /bin/bash -n check-unix.sh
               python3 .github/scripts/run_scan.py --report-dir /reports
-            '
+            ' 2>&1 | tee scan-reports/container.log; then
+            exit 0
+          else
+            python3 -c 'from pathlib import Path; text="\n".join(Path("scan-reports/container.log").read_text(errors="replace").splitlines()[-30:]); print("::error title=Container setup or scan failed::"+text.replace("%","%25").replace("\r","%0D").replace("\n","%0A"))'
+            exit 1
+          fi
       - name: Publish scan outcome
         if: always()
         run: |
