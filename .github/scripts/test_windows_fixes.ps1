@@ -113,6 +113,8 @@ try {
   AssertEqual 'fix loop exits 3 on PowerShell error' $LASTEXITCODE 3
   AssertEqual 'fix loop does not print success for failed command' ([bool]($output -match '\[OK\].*cmd 1')) $false
   Write-Host "Passed $script:TestCount Windows fix regression checks (PowerShell $($PSVersionTable.PSVersion))."
+  # The child scenario above deliberately exits 3; don't leak that to the Actions step wrapper.
+  $global:LASTEXITCODE = 0
 } finally {
   foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }
   $fullRoot = [IO.Path]::GetFullPath($testRoot)

@@ -38,7 +38,7 @@ $Steps = New-Object System.Collections.Generic.List[string]
 $ToolFix = @{}
 $SeenBundles = @{}
 $WinFix = "install Windows updates; else run Block-EmudhraCompromisedCA.ps1 elevated (see $Ref)"
-$GitFix = "update Git for Windows (git update-git-for-windows); if its bundles still trust the test hosts, from an elevated prompt: copy the emSign and AAA root PEMs (see $Ref) to <Git>\etc\pki\ca-trust\source\blocklist\, run '<Git>\usr\bin\sh.exe -c /usr/bin/update-ca-trust', then copy <Git>\etc\pki\ca-trust\extracted\pem\tls-ca-bundle.pem over <Git>\mingw64\etc\ssl\certs\ca-bundle.crt and <Git>\ucrt64\etc\ssl\certs\ca-bundle.crt"
+$GitFix = "update Git for Windows (git update-git-for-windows); if its bundles still trust the test hosts, from an elevated prompt: copy the PEM of emSign ECC Root CA - G3 (SHA-256 86A1ECBA089C4A8D3BBE2734C612BA341D813E043CF9E8A862CD5C57A36BBE6B; see $Ref) to <Git>\etc\pki\ca-trust\source\blocklist\ (Git's bundles do not ship AAA Certificate Services; do not blocklist it), run '<Git>\usr\bin\sh.exe -c /usr/bin/update-ca-trust', then copy <Git>\etc\pki\ca-trust\extracted\pem\tls-ca-bundle.pem over <Git>\mingw64\etc\ssl\certs\ca-bundle.crt and <Git>\ucrt64\etc\ssl\certs\ca-bundle.crt"
 
 # SHA-256 of the 16 compromised intermediates + Sectigo cross-signs (impacted-intermediates.json)
 $Intermediates = @(
